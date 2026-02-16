@@ -9,7 +9,6 @@
 
 #include <vector>
 #include <algorithm>
-#include <iostream>
 
 using namespace std;
 
@@ -29,22 +28,3 @@ public:
         return max_sum;
     }
 };
-
-// 测试代码
-int main() {
-    Solution solution;
-
-    // 测试用例 1
-    vector<int> nums1 = {-2, 1, -3, 4, -1, 2, 1, -5, 4};
-    cout << "Test 1: " << solution.maxSubArray(nums1) << endl;  // 期望输出: 6
-
-    // 测试用例 2
-    vector<int> nums2 = {1};
-    cout << "Test 2: " << solution.maxSubArray(nums2) << endl;  // 期望输出: 1
-
-    // 测试用例 3
-    vector<int> nums3 = {5, 4, -1, 7, 8};
-    cout << "Test 3: " << solution.maxSubArray(nums3) << endl;  // 期望输出: 23
-
-    return 0;
-}
