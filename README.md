@@ -40,15 +40,16 @@
 
 ## 统计
 
-- 总题数：2
+- 总题数：3
 - 简单：1
-- 中等：1
+- 中等：2
 - 困难：0
 
 ## 最近更新
 
 <!-- 请在每次添加新题目时更新此部分 -->
 
+- [单词拆分](./dynamic_programming/word_break.cpp) - 动态规划 - 中等
 - [分割回文串](./backtracking/palindrome_partitioning.cpp) - 回溯 - 中等
 - [合并两个有序链表](./linked_list/merge_two_sorted_lists.cpp) - 链表 - 简单
 
