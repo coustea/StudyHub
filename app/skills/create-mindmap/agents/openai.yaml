@@ -1,0 +1,7 @@
+interface:
+  display_name: "Create Mindmap"
+  short_description: "Turn a topic into a render-ready learning mindmap."
+  default_prompt: "Use $create-mindmap to convert this topic, weak point, and learning goal into a concise Markdown mindmap before calling the renderer."
+
+policy:
+  allow_implicit_invocation: true
