@@ -1,0 +1,7 @@
+[project]
+name = "learn-agent"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=2.41.1",
+]
