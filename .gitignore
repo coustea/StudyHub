@@ -8,3 +8,6 @@ workspaces/
 *.db
 *.sqlite3
 .DS_Store
+
+# IDE 本地配置
+.idea/
