@@ -1,0 +1,53 @@
+# FrameForge 配置文件（保密环境变量通过 ${VAR} 从 backend/.env 读取）
+
+#===============================应用基础配置=============================
+app:
+  name: FrameForge
+  env: development
+  debug: true
+  host: 0.0.0.0
+  port: 8000
+
+#===============================JWT 鉴权配置=============================
+jwt:
+  # 签名密钥请在 .env 中配置 JWT_SECRET_KEY（至少 32 字节）
+  secret_key: ${JWT_SECRET_KEY}
+  algorithm: HS256
+  access_token_expire_minutes: 60
+  refresh_token_expire_days: 7
+
+#===============================Agent 与模型配置=========================
+agent:
+  # 相对后端根目录（backend/）解析；每个项目的物理工作目录为 {workspace_dir}/{user_id}/{project_id}/
+  workspace_dir: ./workspaces
+  skills_dir: ./app/agent/skills
+  # 对应 langchain_openai.ChatOpenAI 核心初始化参数
+  llm:
+    model: "spark-x2.6"
+    base_url: "https://maas-api.cn-huabei-1.xf-yun.com/v2"
+    # API Key 请在 .env 中配置 OPENAI_API_KEY
+    api_key: ${OPENAI_API_KEY}
+    temperature: 0.7
+    max_tokens: 8192
+    timeout: 120.0
+    max_retries: 2
+  tavily: ${TAVILY_API_KEY}
+
+#===============================数据库配置===============================
+database:
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    database: frameforge
+    username: root
+    # 密码请在 .env 中配置 MYSQL_PASSWORD
+    password: ${MYSQL_PASSWORD}
+    pool_size: 10
+    max_overflow: 20
+
+  redis:
+    addr: 127.0.0.1
+    port: 6379
+    # 密码请在 .env 中配置 REDIS_PASSWORD
+    password: ${REDIS_PASSWORD}
+    db: 0
