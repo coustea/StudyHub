@@ -6,20 +6,18 @@ import (
 	"github.com/coustea/goforge/workerpool"
 )
 
-func add(a, b int) {
+func add(a, b int) int {
 	fmt.Printf("add: %d + %d = %d\n", a, b, a+b)
+	return a + b
 }
 
 func main() {
-	pool := workerpool.NewWorkerPool(3)
+	pool := workerpool.NewWorkerPool(4)
+	defer pool.Close()
 
-	for i := 0; i < 1000000; i++ {
-		pool.Submit(func() {
-			add(i, i+3)
-			
+	for i := 0; i < 3; i++ {
+		pool.SubmitWithResult(func() (int, error) {
+			return add(i, i+3), nil
 		})
 	}
-
-	// 关闭任务队列并等待所有 worker 跑完，否则 main 退出会丢掉还没执行的任务。
-	pool.Close()
 }
