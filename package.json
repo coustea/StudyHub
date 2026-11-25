@@ -1,0 +1,56 @@
+{
+  "name": "md-notes-site",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Self-hosted Markdown notes and tutorials site with project-based nested folders",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "node server/index.js",
+    "dev:client": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "npm run build && node server/index.js",
+    "test": "node --test tests",
+    "reset-password": "node scripts/reset-password.js",
+    "clean-uploads": "node scripts/clean-orphan-uploads.js",
+    "shots": "node scripts/shoot.js",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@phosphor-icons/react": "^2.1.10",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.5.0",
+    "compression": "^1.8.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "express-rate-limit": "^8.7.5",
+    "gray-matter": "^4.0.3",
+    "hast-util-to-text": "^4.0.5",
+    "helmet": "^8.3.0",
+    "highlight.js": "^11.10.0",
+    "jsonwebtoken": "^9.0.2",
+    "lowlight": "^3.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "react-router-dom": "^6.26.2",
+    "rehype-slug": "^6.0.0",
+    "remark-gfm": "^4.0.0",
+    "unist-util-visit": "^5.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.7.5",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.2",
+    "concurrently": "^9.0.1",
+    "playwright-core": "^1.65.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.8"
+  }
+}

@@ -1,0 +1,39 @@
+# 构建上下文瘦身：这些内容既不需要进镜像，也会拖慢构建
+node_modules
+dist
+
+# 运行时数据（数据库、上传文件、JWT 密钥）绝对不能打进镜像
+data
+
+# 版本控制与本地工具
+.git
+.gitattributes
+.gitignore
+.vscode
+.shots
+tsconfig.tsbuildinfo
+
+# 测试、示例、文档：运行镜像用不到
+tests
+examples
+scripts
+*.log
+
+# 环境变量：只允许 .env.example 进入构建上下文，真实密钥不进
+.env
+.env.*
+!.env.example
+
+# 部署文件（systemd/nginx/备份脚本）由宿主机使用，不需要进镜像
+deploy
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+
+# 编辑器层的 LF 约束与 Docker 无关，不进构建上下文
+.editorconfig

@@ -1,0 +1,141 @@
+# md-notes systemd 服务单元
+#
+# 安装步骤（Debian 12 / Ubuntu 22.04+，需要 Node.js >= 20 与 nginx）：
+#
+#   0) 装 Node 20（发行版自带的可能过旧，用 NodeSource 源）：
+#        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+#        sudo apt-get install -y nodejs nginx git
+#        node -v      # 必须是 v20.x 或更高
+#
+#   1) 建专用系统用户（无登录 shell，不能 sudo）：
+#        sudo useradd --system --home /opt/md-notes --shell /usr/sbin/nologin notes
+#
+#   2) 放代码并构建：
+#        sudo mkdir -p /opt/md-notes
+#        sudo git clone <你的仓库地址> /opt/md-notes
+#        cd /opt/md-notes
+#        sudo npm ci
+#        sudo npm run build
+#
+#   3) 建数据目录并交给运行用户（这一步不能漏，否则服务起来后写不了库）：
+#        sudo mkdir -p /opt/md-notes/data
+#        sudo chown -R notes:notes /opt/md-notes/data
+#        sudo chmod 700 /opt/md-notes/data
+#
+#   4) 配置环境变量（.env 里有数据库口令等敏感信息，权限必须 600）：
+#        sudo cp /opt/md-notes/.env.example /opt/md-notes/.env
+#        sudo nano /opt/md-notes/.env
+#          # 至少要改：DEFAULT_ADMIN_PASSWORD、JWT_SECRET、SITE_URL、ALLOWED_ORIGINS
+#          # 裸机反代建议同时把 HOST 改成 127.0.0.1
+#        sudo chown notes:notes /opt/md-notes/.env
+#        sudo chmod 600 /opt/md-notes/.env
+#
+#   5) 安装服务并启动：
+#        sudo cp /opt/md-notes/deploy/md-notes.service /etc/systemd/system/md-notes.service
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now md-notes
+#        systemctl status md-notes
+#        journalctl -u md-notes -f        # 看启动日志
+#        curl -fsS http://127.0.0.1:3001/api/healthz && echo
+#
+#   6) 配 nginx 反代与 HTTPS：
+#        sudo cp /opt/md-notes/deploy/nginx.conf /etc/nginx/conf.d/md-notes.conf
+#        sudo sed -i 's/notes.example.com/你的域名/g' /etc/nginx/conf.d/md-notes.conf
+#        sudo nginx -t && sudo systemctl reload nginx
+#        sudo certbot --nginx -d 你的域名
+#
+# 升级流程：
+#        cd /opt/md-notes
+#        sudo git pull
+#        sudo npm ci
+#        sudo npm run build
+#        sudo systemctl restart md-notes
+#        curl -fsS http://127.0.0.1:3001/api/healthz && echo
+#
+# 排错常用：
+#        systemctl status md-notes
+#        journalctl -u md-notes -n 200 --no-pager
+#        journalctl -u md-notes -p err --since today
+#        sudo systemd-analyze security md-notes    # 查看加固评分
+
+[Unit]
+Description=md-notes 自托管 Markdown 笔记站
+Documentation=file:/opt/md-notes/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 专用非特权用户运行，绝不要用 root
+User=notes
+Group=notes
+
+WorkingDirectory=/opt/md-notes
+
+# 环境变量（PORT / HOST / DATA_DIR / JWT_SECRET / SITE_URL 等）
+EnvironmentFile=/opt/md-notes/.env
+
+# 如果 node 不在 /usr/bin/node（用 nvm 安装的就属于这种情况），
+# 用 `which node` 查出来改这一行，systemd 不读用户的 PATH。
+ExecStart=/usr/bin/node server/index.js
+
+Restart=always
+RestartSec=3
+
+# 应用自己处理 SIGTERM：关闭 HTTP server、checkpoint WAL，内部最多等 10 秒；
+# TimeoutStopSec=20 给足余量，超时才发 SIGKILL。
+# KillMode=mixed 表示 SIGTERM 只发给主进程，等超时后再对整个服务组强杀。
+KillSignal=SIGTERM
+TimeoutStopSec=20
+KillMode=mixed
+
+# 日志走 journald：journalctl -u md-notes -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=md-notes
+
+############################################################
+# 安全加固
+############################################################
+
+# 禁止通过 setuid/setgid 提权
+NoNewPrivileges=true
+
+# 独立 /tmp，随服务停止自动清理（上传临时文件、SQLite 临时文件都在这里）
+PrivateTmp=true
+PrivateDevices=true
+
+# 整个文件系统只读，只放开数据目录；node_modules 与 dist 运行期不需要写
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/md-notes/data
+
+# 屏蔽内核、控制组、时钟等敏感面
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+
+# 限制可用的地址族、命名空间与提权相关系统调用
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# 注意：不要开 MemoryDenyWriteExecute=true。
+# V8 的 JIT 需要可写可执行内存，better-sqlite3 的原生模块也依赖它，开了会直接启动失败。
+
+# 白名单式系统调用过滤：只允许常规服务所需，mount / ptrace 等直接 EPERM
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# 文件描述符与进程数上限
+LimitNOFILE=65535
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

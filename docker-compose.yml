@@ -1,0 +1,77 @@
+# md-notes 生产编排文件
+#
+# 用法：
+#   cp .env.example .env      # 然后按注释改密码、JWT_SECRET、SITE_URL
+#   docker compose up -d --build
+#   docker compose logs -f
+#   docker compose ps         # STATUS 里出现 (healthy) 表示健康检查通过
+#
+# 不需要写 version: 字段，Compose V2 已忽略它。
+
+services:
+  md-notes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: md-notes:latest
+    container_name: md-notes
+
+    # 环境变量统一放在 .env 里，compose 与裸机部署共用同一份配置
+    env_file:
+      - .env
+
+    environment:
+      # 容器内固定监听 3001 / 0.0.0.0，避免 .env 里改 PORT 后端口映射对不上。
+      # 想改对外端口请用 HOST_PORT（见下面 ports）。
+      PORT: "3001"
+      HOST: "0.0.0.0"
+      DATA_DIR: "/app/data"
+      NODE_ENV: "production"
+
+    ports:
+      # 宿主机端口可用 HOST_PORT 覆盖，容器内始终是 3001
+      - "${HOST_PORT:-3001}:3001"
+
+    volumes:
+      # 唯一需要持久化的目录：notes.db、notes.db-wal、notes.db-shm、uploads/、.jwt-secret
+      - md-notes-data:/app/data
+
+    restart: unless-stopped
+
+    # 应用收到 SIGTERM 后会关闭 server、checkpoint WAL，最长等 10 秒；
+    # 这里的 20 秒给它留足余量，避免被 SIGKILL 打断导致 WAL 没合并。
+    stop_grace_period: 20s
+
+    healthcheck:
+      # 与 Dockerfile 里的 HEALTHCHECK 保持一致：只用 Node 内置 fetch，不依赖 curl/wget
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:' + (process.env.PORT || 3001) + '/api/healthz').then((r) => { if (!r.ok) process.exit(1); return r.json() }).then((j) => process.exit(j && j.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # 让 PID 1 交给 tini 处理，信号转发与僵尸进程回收更稳
+    init: true
+
+    # 禁止容器内提权；应用以镜像里的 node 用户（非 root）运行
+    security_opt:
+      - no-new-privileges:true
+
+    # 日志轮转，避免长期运行把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 说明：这里没有启用 read_only: true。
+    # 应用虽然只写 /app/data，但 better-sqlite3 在某些情况下会在 /tmp 建临时文件，
+    # 加 read_only 需要同时配 tmpfs，收益有限且容易踩坑，故保持默认可写根文件系统。
+
+volumes:
+  md-notes-data:
+    name: md-notes-data

@@ -1,0 +1,23 @@
+# 统一编辑器行为，避免在 Windows 上改文件时又写出 CRLF。
+# Dockerfile 用 CRLF 会让反斜杠续行失效（`\` 后面跟着 \r 不构成续行），
+# shell 脚本用 CRLF 会报 bad interpreter，所以这里强制 LF。
+# .gitattributes 是仓库层的兜底，这个文件是编辑器层的兜底，两者不冲突。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格是有意义的换行语法，不能自动删
+trim_trailing_whitespace = false
+
+[*.sh]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
