@@ -48,7 +48,14 @@ export default function MarkdownView({ title, content, emptyHint, stripLeadingTi
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSlug, rehypeHighlightNotebook]}
-        components={{ pre: CodeBlock }}
+        components={{
+          pre: CodeBlock,
+          table: ({ children }) => (
+            <div className="table-scroll" role="region" aria-label="表格内容" tabIndex={0}>
+              <table>{children}</table>
+            </div>
+          ),
+        }}
       >
         {body}
       </ReactMarkdown>

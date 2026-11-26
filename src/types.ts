@@ -37,3 +37,34 @@ export interface NoteNode {
   created_at: string
   updated_at: string
 }
+
+export interface ReaderNote {
+  id: number
+  project_id: number
+  project_name: string
+  title: string
+  tags: string
+  excerpt: string
+  reading_minutes: number
+  updated_at: string
+}
+
+export interface AdminNote {
+  id: number
+  project_id: number
+  project_name: string
+  project_status: 'draft' | 'published'
+  title: string
+  tags: string
+  status: 'draft' | 'published'
+  daily_date: string
+  created_at: string
+  updated_at: string
+}
+
+export interface AiConfig {
+  model: string
+  baseURL: string
+  hasApiKey: boolean
+  apiKeyHint: string
+}

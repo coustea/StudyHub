@@ -26,7 +26,7 @@ function paint(mode: ThemeMode) {
 /** 在首屏渲染前调用，避免深色模式用户看到白屏闪烁。 */
 export function initTheme() {
   const stored = localStorage.getItem(STORAGE_KEY) as ThemeMode | null
-  const mode: ThemeMode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system'
+  const mode: ThemeMode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'light'
   paint(mode)
   return mode
 }
@@ -43,7 +43,7 @@ const ThemeContext = createContext<ThemeValue | null>(null)
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<ThemeMode>(() => {
     const stored = localStorage.getItem(STORAGE_KEY) as ThemeMode | null
-    return stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system'
+    return stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'light'
   })
   const [resolved, setResolved] = useState<ResolvedTheme>(() => resolveTheme(mode))
 

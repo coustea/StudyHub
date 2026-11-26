@@ -23,7 +23,7 @@ export function SiteProvider({ children }: { children: ReactNode }) {
   const [site, setSite] = useState<SiteMeta>(DEFAULT_SITE)
 
   useEffect(() => {
-    api.site()
+    api.site(true)
       .then((res) => setSite({ ...DEFAULT_SITE, ...res.site }))
       .catch(() => {})
   }, [])
