@@ -1,0 +1,30 @@
+@import "tailwindcss/theme";
+@import "tailwindcss/utilities";
+@import "tw-animate-css";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--paper);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-ink);
+  --color-secondary: var(--surface-2);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface-2);
+  --color-muted-foreground: var(--ink-3);
+  --color-accent: var(--accent-wash);
+  --color-accent-foreground: var(--accent);
+  --color-destructive: var(--danger);
+  --color-border: var(--rule);
+  --color-input: var(--rule-strong);
+  --color-ring: var(--accent);
+  --radius-sm: var(--r-1);
+  --radius-md: var(--r-1);
+  --radius-lg: var(--r-2);
+  --radius-xl: var(--r-2);
+}

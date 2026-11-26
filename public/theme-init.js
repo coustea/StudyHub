@@ -3,7 +3,7 @@
 (function () {
   try {
     var stored = localStorage.getItem('notes_theme');
-    var mode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+    var mode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'light';
     var dark = mode === 'dark' || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
     document.documentElement.dataset.themeMode = mode;
