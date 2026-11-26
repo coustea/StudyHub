@@ -29,9 +29,9 @@ async function call(urlPath, method = 'GET', body, token) {
 }
 
 before(async () => {
-  server = spawn(process.execPath, ['server/index.js'], {
+  server = spawn(process.execPath, ['--require', path.join(__dirname, 'mock-ai-fetch.js'), 'server/index.js'], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), DATA_DIR, JWT_SECRET: 'test-only-secret', SITE_OWNER: 'owner' },
+    env: { ...process.env, PORT: String(PORT), DATA_DIR, JWT_SECRET: 'test-only-secret', SITE_OWNER: 'owner', OPENAI_API_KEY: 'unused-env-key' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   await new Promise((resolve, reject) => {
@@ -75,6 +75,7 @@ test('笔记库 API 完整流程', async (t) => {
     assert.equal(defaultLogin.status, 200, '内置账号应可登录')
     assert.ok(defaultLogin.data.token)
     assert.equal(defaultLogin.data.user.username, 'coustea')
+    state.coustea = defaultLogin.data.token
 
     const blocked = await call('/api/auth/register', 'POST', {
       username: 'newuser', password: 'pass123',
@@ -109,6 +110,128 @@ test('笔记库 API 完整流程', async (t) => {
       oldPassword: 'pass123', newPassword: 'newpass123',
     }, state.owner)).status, 200)
     assert.equal((await call('/api/auth/login', 'POST', { username: 'owner', password: 'newpass123' })).status, 200)
+  })
+
+  await t.test('AI 写作仅 coustea 可用，并使用页面提交的密钥', async () => {
+    const input = { model: 'test-model', baseURL: '', mode: 'draft', prompt: '写一段笔记', title: '测试', context: '' }
+    assert.equal((await call('/api/ai/markdown', 'POST', input)).status, 401)
+    assert.equal((await call('/api/ai/markdown', 'POST', input, state.other)).status, 403)
+    assert.equal((await call('/api/ai/markdown', 'POST', { ...input, apiKey: 'submitted-key' }, state.owner)).status, 403,
+      '即使 SITE_OWNER 指向其他账号，该账号也不能使用 AI')
+    assert.equal((await call('/api/ai/markdown', 'POST', { ...input, model: '' }, state.coustea)).status, 400)
+    assert.equal((await call('/api/ai/markdown', 'POST', { ...input, baseURL: 'http://127.0.0.1:3001/v1' }, state.coustea)).status, 400)
+    assert.equal((await call('/api/ai/markdown', 'POST', { ...input, baseURL: 'https://127.0.0.1/v1' }, state.coustea)).status, 400)
+    assert.equal((await call('/api/ai/markdown', 'POST', { ...input, baseURL: 'https://localhost./v1' }, state.coustea)).status, 400)
+    assert.equal((await call('/api/ai/markdown', 'POST', input, state.coustea)).status, 400, '缺少页面提交的 API Key 应被拒绝')
+    const generated = await call('/api/ai/markdown', 'POST', {
+      ...input, apiKey: 'submitted-key', baseURL: 'https://notes-ai.example.test/v1',
+    }, state.coustea)
+    assert.equal(generated.status, 200)
+    assert.equal(generated.data.markdown, '# 测试笔记')
+  })
+
+  await t.test('讯飞星火与 DeepSeek 走 OpenAI 协议均可用', async () => {
+    const base = { mode: 'draft', prompt: '写一段笔记', title: '兼容性', context: '' }
+
+    // 讯飞星火：Base URL 按官方文档给的是完整端点（.../v2/chat/completions），
+    // 必须被收敛成 /v2 前缀，否则 SDK 会拼出 /chat/completions/chat/completions 的 404。
+    const sparkFull = await call('/api/ai/markdown', 'POST', {
+      ...base,
+      apiKey: 'spark-key',
+      model: 'spark-x2.6',
+      baseURL: 'https://spark-maas.example.test/v2/chat/completions',
+    }, state.coustea)
+    assert.equal(sparkFull.status, 200, '完整端点写法应被自动纠正')
+    assert.equal(sparkFull.data.markdown, '# 星火笔记')
+
+    // 版本前缀写法同样可用
+    const sparkPrefix = await call('/api/ai/markdown', 'POST', {
+      ...base,
+      apiKey: 'spark-key',
+      model: 'spark-x2.6',
+      baseURL: 'https://spark-maas.example.test/v2',
+    }, state.coustea)
+    assert.equal(sparkPrefix.status, 200)
+    assert.equal(sparkPrefix.data.markdown, '# 星火笔记')
+
+    // 思考型模型正文为空、只有 reasoning_content 时不能误判成空响应
+    const sparkThinking = await call('/api/ai/markdown', 'POST', {
+      ...base,
+      prompt: '请思考后写一段笔记',
+      apiKey: 'spark-key',
+      model: 'spark-x2.6',
+      baseURL: 'https://spark-maas.example.test/v2',
+    }, state.coustea)
+    assert.equal(sparkThinking.status, 200)
+    assert.equal(sparkThinking.data.markdown, '# 星火推理笔记', '应回退到 reasoning_content')
+
+    // HTTP 200 里的业务错误码必须被识别，不能当成“模型没有返回内容”
+    const sparkBizError = await call('/api/ai/markdown', 'POST', {
+      ...base,
+      apiKey: 'spark-key',
+      model: 'spark-x2.6',
+      baseURL: 'https://spark-biz-error.example.test/v2',
+    }, state.coustea)
+    assert.equal(sparkBizError.status, 502)
+    assert.match(sparkBizError.data.error, /10013|model not found/, '应透出上游业务错误码与原因')
+
+    // DeepSeek：标准 /v1 前缀
+    const deepseek = await call('/api/ai/markdown', 'POST', {
+      ...base,
+      apiKey: 'deepseek-key',
+      model: 'deepseek-chat',
+      baseURL: 'https://deepseek.example.test/v1',
+    }, state.coustea)
+    assert.equal(deepseek.status, 200)
+    assert.equal(deepseek.data.markdown, '# DeepSeek 笔记')
+
+    // 鉴权失败时错误信息应带上游原因，便于排查
+    const badKey = await call('/api/ai/markdown', 'POST', {
+      ...base,
+      apiKey: 'wrong-key',
+      model: 'deepseek-chat',
+      baseURL: 'https://deepseek.example.test/v1',
+    }, state.coustea)
+    assert.equal(badKey.status, 502)
+    assert.match(badKey.data.error, /鉴权失败/)
+  })
+
+  await t.test('AI 配置连通性自检', async () => {
+    assert.equal((await call('/api/admin/ai-config/test', 'POST', {})).status, 401)
+    assert.equal((await call('/api/admin/ai-config/test', 'POST', {}, state.other)).status, 403)
+
+    const ok = await call('/api/admin/ai-config/test', 'POST', {
+      apiKey: 'spark-key', model: 'spark-x2.6', baseURL: 'https://spark-maas.example.test/v2/chat/completions',
+    }, state.coustea)
+    assert.equal(ok.status, 200)
+    assert.equal(ok.data.ok, true)
+    assert.equal(ok.data.endpoint, 'https://spark-maas.example.test/v2', '自检应回显收敛后的真实端点')
+
+    const bizFail = await call('/api/admin/ai-config/test', 'POST', {
+      apiKey: 'spark-key', model: 'spark-x2.6', baseURL: 'https://spark-biz-error.example.test/v2',
+    }, state.coustea)
+    assert.equal(bizFail.status, 502)
+    assert.match(bizFail.data.error, /10013/)
+
+    const authFail = await call('/api/admin/ai-config/test', 'POST', {
+      apiKey: 'wrong-key', model: 'spark-x2.6', baseURL: 'https://spark-maas.example.test/v2',
+    }, state.coustea)
+    assert.equal(authFail.status, 502)
+    assert.match(authFail.data.error, /鉴权失败/)
+
+    const badUrl = await call('/api/admin/ai-config/test', 'POST', {
+      apiKey: 'spark-key', model: 'spark-x2.6', baseURL: 'http://spark-maas.example.test/v2',
+    }, state.coustea)
+    assert.equal(badUrl.status, 400)
+  })
+
+  await t.test('管理文章接口仅 coustea 可访问', async () => {
+    assert.equal((await call('/api/admin/notes')).status, 401)
+    assert.equal((await call('/api/admin/notes', 'GET', undefined, state.other)).status, 403)
+    assert.equal((await call('/api/admin/notes', 'GET', undefined, state.owner)).status, 403)
+    const result = await call('/api/admin/notes', 'GET', undefined, state.coustea)
+    assert.equal(result.status, 200)
+    assert.ok(Array.isArray(result.data.notes))
   })
 
   await t.test('项目创建与可见性', async () => {
@@ -152,15 +275,24 @@ test('笔记库 API 完整流程', async (t) => {
     assert.equal(res.status, 201)
     state.docId = res.data.node.id
 
+    assert.equal((await call('/api/nodes', 'POST', {
+      projectId: state.pid, parentId: state.docId, kind: 'doc', title: '不能挂在笔记下',
+    }, state.owner)).status, 400)
+
     assert.equal((await call(`/api/nodes/${state.docId}`)).status, 404, '草稿笔记对访客不可见')
 
     res = await call(`/api/nodes/${state.docId}`, 'PATCH', { content: '# React 入门\n\n使用 useState 与 useEffect 管理状态。', status: 'published' }, state.owner)
     assert.equal(res.status, 200)
-    assert.equal((await call(`/api/nodes/${state.docId}`)).status, 200)
+    assert.equal((await call(`/api/nodes/${state.docId}`)).status, 404, '草稿项目里的已发布笔记也不能直读')
+    assert.equal((await call(`/api/nodes/${state.docId}`, 'GET', undefined, state.owner)).status, 200)
 
     res = await call(`/api/nodes/${state.docId}`, 'PATCH', { parentId: state.folderId }, state.owner)
     assert.equal(res.status, 200)
     assert.equal(res.data.node.parent_id, state.folderId)
+
+    assert.equal((await call(`/api/nodes/${state.docId}`, 'PATCH', {
+      parentId: state.docId,
+    }, state.owner)).status, 400)
 
     res = await call(`/api/nodes/${state.folderId}`, 'PATCH', { parentId: state.childFolderId }, state.owner)
     assert.equal(res.status, 400, '不能把文件夹移动进自己的子目录')
@@ -170,10 +302,65 @@ test('笔记库 API 完整流程', async (t) => {
     assert.equal((await call(`/api/nodes/${state.docId}`, 'DELETE', undefined, state.other)).status, 403)
   })
 
-  await t.test('项目发布级联与公开读取', async () => {
+  await t.test('文件树移动与排序', async () => {
+    const project = await call('/api/projects', 'POST', { name: '移动测试', status: 'draft' }, state.owner)
+    assert.equal(project.status, 201)
+    const pid = project.data.project.id
+    const create = async (title, kind, parentId = 0) => {
+      const result = await call('/api/nodes', 'POST', { projectId: pid, parentId, kind, title, status: 'published' }, state.owner)
+      assert.equal(result.status, 201)
+      return result.data.node.id
+    }
+    const folder = await create('目录 A', 'folder')
+    const secondFolder = await create('目录 B', 'folder')
+    const first = await create('笔记 A', 'doc')
+    const second = await create('笔记 B', 'doc')
+    const child = await create('子目录', 'folder', folder)
+    const move = (id, parentId, beforeId, token = state.owner) =>
+      call(`/api/nodes/${id}/move`, 'POST', { parentId, beforeId }, token)
+
+    assert.equal((await move(second, 0, first)).status, 200)
+    let tree = (await call(`/api/projects/${pid}`, 'GET', undefined, state.owner)).data.nodes
+    assert.deepEqual(tree.filter((node) => node.parent_id === 0).map((node) => node.id), [folder, secondFolder, second, first])
+
+    assert.equal((await move(second, folder, null)).status, 200)
+    tree = (await call(`/api/projects/${pid}`, 'GET', undefined, state.owner)).data.nodes
+    assert.deepEqual(tree.filter((node) => node.parent_id === folder).map((node) => node.id), [child, second])
+    assert.equal((await move(folder, child, null)).status, 400, '不能移进自己的子目录')
+    assert.equal((await move(first, folder, secondFolder)).status, 400, '锚点必须在目标目录中')
+    assert.equal((await move(first, folder, null, state.other)).status, 403)
+    assert.equal((await move(first, folder, null, null)).status, 401)
+  })
+
+  await t.test('项目发布与公开读取', async () => {
     assert.equal((await call(`/api/projects/${state.pid}`)).status, 404, '项目未发布时整体不可见')
     const res = await call(`/api/projects/${state.pid}`, 'PATCH', { status: 'published' }, state.owner)
     assert.equal(res.status, 200)
+    assert.equal((await call(`/api/nodes/${state.docId}`)).status, 200)
+
+    const draft = await call('/api/nodes', 'POST', {
+      projectId: state.pid, kind: 'doc', title: '暂不公开', status: 'draft',
+    }, state.owner)
+    assert.equal(draft.status, 201)
+    await call(`/api/projects/${state.pid}`, 'PATCH', { status: 'draft' }, state.owner)
+    await call(`/api/projects/${state.pid}`, 'PATCH', { status: 'published' }, state.owner)
+    assert.equal((await call(`/api/nodes/${draft.data.node.id}`)).status, 404, '重新发布项目不能发布笔记草稿')
+
+    const hiddenFolder = await call('/api/nodes', 'POST', {
+      projectId: state.pid, kind: 'folder', title: '隐藏目录', status: 'draft',
+    }, state.owner)
+    const hiddenChild = await call('/api/nodes', 'POST', {
+      projectId: state.pid, parentId: hiddenFolder.data.node.id,
+      kind: 'doc', title: '隐藏目录中的公开笔记', content: '秘密目录检索词',
+      tags: '秘密目录标签', status: 'published',
+    }, state.owner)
+    assert.equal((await call(`/api/nodes/${hiddenChild.data.node.id}`)).status, 404)
+    assert.equal((await call('/api/search?q=秘密目录检索词')).data.notes.length, 0)
+    assert.equal((await call('/api/recent')).data.notes.some((n) => n.id === hiddenChild.data.node.id), false)
+    assert.equal((await call('/api/tags')).data.tags.some((tag) => tag.tag === '秘密目录标签'), false)
+    assert.equal((await call('/api/overview')).data.recent.some((n) => n.id === hiddenChild.data.node.id), false)
+    assert.equal((await fetch(`${base}/rss.xml`).then((res) => res.text())).includes('隐藏目录中的公开笔记'), false)
+    assert.equal((await fetch(`${base}/sitemap.xml`).then((res) => res.text())).includes(`/n/${hiddenChild.data.node.id}`), false)
 
     const detail = await call(`/api/projects/${state.pid}`)
     assert.equal(detail.status, 200)
@@ -185,6 +372,30 @@ test('笔记库 API 完整流程', async (t) => {
     const listed = list.data.projects.find((p) => p.id === state.pid)
     assert.equal(listed.doc_count, 1)
     assert.ok(Array.isArray(listed.tags) && listed.tags.includes('React'), '项目列表应聚合标签')
+  })
+
+  await t.test('历史版本仅作者可读，恢复时保留当前版本', async () => {
+    const url = `/api/nodes/${state.docId}/revisions`
+    assert.equal((await call(url)).status, 401)
+    assert.equal((await call(url, 'GET', undefined, state.other)).status, 403)
+    let history = await call(url, 'GET', undefined, state.owner)
+    assert.equal(history.data.revisions.length, 1)
+    const firstId = history.data.revisions[0].id
+    const first = await call(`${url}/${firstId}`, 'GET', undefined, state.owner)
+    assert.match(first.data.revision.content, /使用 useState 管理组件状态/)
+    assert.equal((await call(`${url}/${firstId}`, 'GET', undefined, state.other)).status, 403)
+
+    await call(`/api/nodes/${state.docId}`, 'PATCH', { status: 'draft' }, state.owner)
+    history = await call(url, 'GET', undefined, state.owner)
+    assert.equal(history.data.revisions.length, 1, '只切换发布状态不生成正文版本')
+    await call(`/api/nodes/${state.docId}`, 'PATCH', {
+      content: first.data.revision.content, status: 'published',
+    }, state.owner)
+    history = await call(url, 'GET', undefined, state.owner)
+    assert.equal(history.data.revisions.length, 2, '恢复旧内容时当前内容也应进入历史')
+    const current = await call(`/api/nodes/${state.docId}`, 'GET', undefined, state.owner)
+    assert.equal(current.data.node.content, first.data.revision.content)
+    assert.equal((await call(`${url}/999999`, 'GET', undefined, state.owner)).status, 404)
   })
 
   await t.test('Markdown 导入与 frontmatter', async () => {
@@ -216,7 +427,22 @@ test('笔记库 API 完整流程', async (t) => {
     assert.equal(doc.tags, 'React,Hooks')
     assert.ok(doc.content.includes('# useState'))
 
+    const again = await call('/api/import', 'POST', {
+      projectId: state.pid, parentId: 0, status: 'published',
+      files: [{ name: 'useState.md', path: '02 进阶/Hooks/useState.md', content: '# 已修改源文件' }],
+    }, state.owner)
+    assert.equal(again.data.imported, 0)
+    assert.equal(again.data.duplicates, 1)
+    const afterImport = await call(`/api/projects/${state.pid}`)
+    assert.equal(afterImport.data.nodes.filter((n) => n.kind === 'doc').length,
+      detail.data.nodes.filter((n) => n.kind === 'doc').length)
+    assert.equal(afterImport.data.nodes.find((n) => n.id === doc.id).content, doc.content, '重复导入不能覆盖笔记')
+
     assert.equal((await call('/api/import', 'POST', { projectId: state.pid, files: [] }, state.owner)).status, 400)
+    assert.equal((await call('/api/import', 'POST', {
+      projectId: state.pid, parentId: state.docId,
+      files: [{ name: 'wrong.md', content: '# wrong' }],
+    }, state.owner)).status, 400)
     assert.equal((await call('/api/import', 'POST', { projectId: state.pid, files: [{ name: 'a.md', content: 'x' }] })).status, 401)
   })
 
@@ -441,8 +667,75 @@ test('笔记库 API 完整流程', async (t) => {
       false,
       '访客不应看到草稿项目',
     )
+    const ownerOverview = await call('/api/overview', 'GET', undefined, state.owner)
+    assert.equal(ownerOverview.data.projects.some((p) => p.id === draftProject.data.project.id), true)
+    const publicOverview = await call('/api/overview?public=1', 'GET', undefined, state.owner)
+    assert.equal(publicOverview.data.projects.some((p) => p.id === draftProject.data.project.id), false,
+      '已登录账号打开阅读首页也不能看到草稿项目')
     assert.equal((await call(`/api/projects/${pid}`, 'DELETE', undefined, state.owner)).status, 200)
     assert.equal((await call(`/api/projects/${draftProject.data.project.id}`, 'DELETE', undefined, state.owner)).status, 200)
+  })
+
+  await t.test('系统 AI 模型配置持久化、批量文章管理与公开视图隔离', async () => {
+    // 1. 系统 AI 模型配置仅 coustea 可读写，且不回显明文 Key
+    assert.equal((await call('/api/admin/ai-config')).status, 401)
+    assert.equal((await call('/api/admin/ai-config', 'GET', undefined, state.owner)).status, 403)
+    const initialCfg = await call('/api/admin/ai-config', 'GET', undefined, state.coustea)
+    assert.equal(initialCfg.status, 200)
+    assert.equal(initialCfg.data.config.hasApiKey, false)
+
+    const badUrl = await call('/api/admin/ai-config', 'PUT', {
+      apiKey: 'sk-test-secret-1234', model: 'gpt-4o-mini', baseURL: 'http://127.0.0.1/v1',
+    }, state.coustea)
+    assert.equal(badUrl.status, 400)
+
+    const saved = await call('/api/admin/ai-config', 'PUT', {
+      apiKey: 'submitted-key', model: 'test-model', baseURL: 'https://notes-ai.example.test/v1',
+    }, state.coustea)
+    assert.equal(saved.status, 200)
+    assert.equal(saved.data.config.hasApiKey, true)
+    assert.equal(saved.data.config.model, 'test-model')
+    assert.equal(saved.data.config.apiKey, undefined, '不能回显明文 API Key')
+
+    // 保存系统模型后，调用 /api/ai/markdown 不再需要每次重复传 apiKey/model/baseURL
+    const viaSaved = await call('/api/ai/markdown', 'POST', {
+      mode: 'draft', prompt: '写一段笔记', title: '系统模型测试', context: '',
+    }, state.coustea)
+    assert.equal(viaSaved.status, 200)
+    assert.equal(viaSaved.data.markdown, '# 测试笔记')
+
+    // 2. 批量文章管理与 ?public=1 公开视图隔离
+    const db = new Database(path.join(DATA_DIR, 'notes.db'))
+    const cousteaId = db.prepare("SELECT id FROM users WHERE username = 'coustea'").get().id
+    const projId = Number(db.prepare(
+      "INSERT INTO projects (owner_id, name, slug, description, status) VALUES (?, '后台测试专题', 'admin-batch-proj', 'desc', 'published')",
+    ).run(cousteaId).lastInsertRowid)
+    const n1 = Number(db.prepare(
+      "INSERT INTO nodes (owner_id, project_id, parent_id, kind, title, slug, content, status) VALUES (?, ?, 0, 'doc', '草稿A', 'draft-a', '正文内容', 'draft')",
+    ).run(cousteaId, projId).lastInsertRowid)
+    const n2 = Number(db.prepare(
+      "INSERT INTO nodes (owner_id, project_id, parent_id, kind, title, slug, content, status) VALUES (?, ?, 0, 'doc', '公开B', 'pub-b', '公开正文', 'published')",
+    ).run(cousteaId, projId).lastInsertRowid)
+    db.close()
+
+    // 即使携带 coustea token，?public=1 也只返回已发布内容
+    const pubProj = await call(`/api/projects/${projId}?public=1`, 'GET', undefined, state.coustea)
+    assert.equal(pubProj.status, 200)
+    assert.equal(pubProj.data.nodes.some((n) => n.id === n1), false, 'public=1 不应包含草稿')
+    assert.equal(pubProj.data.nodes.some((n) => n.id === n2), true)
+
+    // 批量发布仅 coustea 可调用
+    assert.equal((await call('/api/admin/notes/batch', 'POST', { ids: [n1], action: 'publish' }, state.owner)).status, 403)
+    const batchPub = await call('/api/admin/notes/batch', 'POST', { ids: [n1], action: 'publish' }, state.coustea)
+    assert.equal(batchPub.status, 200)
+    assert.equal(batchPub.data.affected, 1)
+
+    const pubProjAfter = await call(`/api/projects/${projId}?public=1`, 'GET', undefined, state.coustea)
+    assert.equal(pubProjAfter.data.nodes.some((n) => n.id === n1), true, '批量发布后 public=1 应可见')
+
+    const batchTrash = await call('/api/admin/notes/batch', 'POST', { ids: [n1, n2], action: 'trash' }, state.coustea)
+    assert.equal(batchTrash.status, 200)
+    assert.equal(batchTrash.data.affected, 2)
   })
 
   await t.test('安全响应头、robots 与 404 处理', async () => {

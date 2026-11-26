@@ -29,8 +29,8 @@ services:
       NODE_ENV: "production"
 
     ports:
-      # 宿主机端口可用 HOST_PORT 覆盖，容器内始终是 3001
-      - "${HOST_PORT:-3001}:3001"
+      # 只接受同机 nginx 的连接；HOST_PORT 只改变宿主机端口
+      - "127.0.0.1:${HOST_PORT:-3001}:3001"
 
     volumes:
       # 唯一需要持久化的目录：notes.db、notes.db-wal、notes.db-shm、uploads/、.jwt-secret

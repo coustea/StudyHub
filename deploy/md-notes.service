@@ -38,11 +38,8 @@
 #        journalctl -u md-notes -f        # 看启动日志
 #        curl -fsS http://127.0.0.1:3001/api/healthz && echo
 #
-#   6) 配 nginx 反代与 HTTPS：
-#        sudo cp /opt/md-notes/deploy/nginx.conf /etc/nginx/conf.d/md-notes.conf
-#        sudo sed -i 's/notes.example.com/你的域名/g' /etc/nginx/conf.d/md-notes.conf
-#        sudo nginx -t && sudo systemctl reload nginx
-#        sudo certbot --nginx -d 你的域名
+#   6) 配 nginx 反代与 HTTPS：按 README 的顺序先启用 nginx-bootstrap.conf，
+#      用 certbot certonly --webroot 取得证书，再启用 nginx.conf。
 #
 # 升级流程：
 #        cd /opt/md-notes

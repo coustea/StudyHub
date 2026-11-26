@@ -257,8 +257,7 @@ fi
 #
 # 5. 打包 notes.db 与 uploads/
 #
-#    uploads/ 可能正被写入，tar 会报 “file changed as we read it” 并以 1 退出，
-#    这种情况只需警告不算失败；其他非零退出码才算真失败。
+#    uploads/ 可能正被写入；tar 非零退出时不能把不完整归档当作成功备份。
 #
 TAR_FILES=(notes.db BACKUP_INFO.txt)
 TAR_EXTRA=()
@@ -286,10 +285,9 @@ set +e
 ( cd "$BACKUP_DIR" && tar ${TAR_OPTS[@]+"${TAR_OPTS[@]}"} -czf "$ARCHIVE_NAME" -C "$STAGE" "${TAR_FILES[@]}" ${TAR_EXTRA[@]+"${TAR_EXTRA[@]}"} )
 TAR_RC=$?
 set -e
-if [ "$TAR_RC" -eq 1 ]; then
-  log_warn "tar 报告文件在打包过程中发生变化（附件正在被写入），归档仍可用"
-elif [ "$TAR_RC" -ne 0 ]; then
+if [ "$TAR_RC" -ne 0 ]; then
   log_error "tar 打包失败，退出码 $TAR_RC"
+  rm -f "$ARCHIVE"
   exit "$TAR_RC"
 fi
 

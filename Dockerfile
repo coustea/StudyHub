@@ -30,7 +30,7 @@ RUN npm ci
 # 构建前端：npm run build = tsc -p tsconfig.json && vite build，产出 /app/dist
 # public/ 必须一起拷：vite 会把里面的 theme-init.js、favicon.svg 原样搬到 dist/，
 # 漏掉的话镜像里就没有首屏主题脚本（会闪一下白）和站点图标。
-COPY tsconfig.json vite.config.ts index.html ./
+COPY tsconfig.json vite.config.mts index.html ./
 COPY public ./public
 COPY src ./src
 RUN npm run build
