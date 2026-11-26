@@ -9,6 +9,8 @@ const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const matter = require('gray-matter')
+const OpenAI = require('openai')
+const net = require('node:net')
 
 // 极简 .env 加载器：不为了 20 行解析引入 dotenv 依赖。
 // 必须在 require('./db') 之前执行，因为 db.js 的 DATA_DIR 也从环境变量来。
@@ -127,6 +129,15 @@ const uploadLimiter = rateLimit({
   validate: false,
 })
 
+const aiLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'AI 请求过于频繁，请稍后再试' },
+  validate: false,
+})
+
 // 记录本次启动是否真的用内置默认密码建了账号。
 // 只有这种情况才需要在自检里提醒改密码；库已存在账号时
 // DEFAULT_ADMIN_PASSWORD 根本不生效，报出来只会让人白改一遍配置。
@@ -140,14 +151,6 @@ function seedDefaultAdmin() {
 
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
   if (existing) return
-
-  const legacy = username === 'coustea'
-    ? db.prepare("SELECT id FROM users WHERE username = 'cosustea'").get()
-    : null
-  if (legacy) {
-    db.prepare('UPDATE users SET username = ? WHERE id = ?').run(username, legacy.id)
-    return
-  }
 
   db.prepare('INSERT INTO users (username, password_hash, display_name) VALUES (?, ?, ?)')
     .run(
@@ -203,6 +206,15 @@ function requireSiteOwner(req, res, next) {
   next()
 }
 
+function requireCoustea(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: '请先登录' })
+  const account = db.prepare('SELECT username FROM users WHERE id = ?').get(req.user.id)
+  if (account?.username !== 'coustea') {
+    return res.status(403).json({ error: '只有 coustea 可以配置和使用 AI' })
+  }
+  next()
+}
+
 function uniqueProjectSlug(userId, name) {
   const base = slugify(name) || 'project'
   let slug = base
@@ -233,6 +245,51 @@ function escapeXml(value) {
 
 function visible(row, user) {
   return row.status === 'published' || (user && row.owner_id === user.id)
+}
+
+function validParent(projectId, parentId) {
+  if (!Number.isSafeInteger(parentId) || parentId < 0) return false
+  if (parentId === 0) return true
+  const parent = db.prepare('SELECT project_id, kind, deleted_at FROM nodes WHERE id = ?').get(parentId)
+  return !!parent && parent.project_id === projectId && parent.kind === 'folder' && !parent.deleted_at
+}
+
+function visibleNode(row, user, project, nodeMap) {
+  if (!visible(row, user) || row.deleted_at) return false
+  const ownerProject = project || db.prepare('SELECT * FROM projects WHERE id = ?').get(row.project_id)
+  if (!ownerProject || !visible(ownerProject, user)) return false
+  let parentId = row.parent_id
+  const seen = new Set([row.id])
+  while (parentId) {
+    if (seen.has(parentId)) return false
+    seen.add(parentId)
+    const parent = nodeMap
+      ? nodeMap.get(parentId)
+      : db.prepare('SELECT * FROM nodes WHERE id = ?').get(parentId)
+    if (!parent || parent.project_id !== row.project_id || parent.deleted_at || !visible(parent, user)) return false
+    parentId = parent.parent_id
+  }
+  return true
+}
+
+function readableNodes(project, user) {
+  const nodes = db.prepare('SELECT * FROM nodes WHERE project_id = ? AND deleted_at IS NULL ORDER BY sort_order, id')
+    .all(project.id)
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]))
+  return nodes.filter((node) => visibleNode(node, user, project, nodeMap))
+}
+
+function projectSummary(project, user) {
+  const nodes = readableNodes(project, user)
+  const tags = [...new Set(nodes
+    .filter((node) => node.kind === 'doc')
+    .flatMap((node) => String(node.tags || '').split(',').map((tag) => tag.trim()).filter(Boolean)))]
+  return {
+    ...project,
+    doc_count: nodes.filter((node) => node.kind === 'doc').length,
+    folder_count: nodes.filter((node) => node.kind === 'folder').length,
+    tags: tags.slice(0, 4),
+  }
 }
 
 // 学习日按服务器本地时区算（容器里由 TZ 环境变量决定），避免 UTC 与本地日期错开一天
@@ -325,10 +382,35 @@ function plainText(markdown) {
     .trim()
 }
 
-function excerpt(text, query) {
-  const clean = plainText(text)
+function stripLeadingTitle(markdown, title) {
+  const raw = String(markdown || '').replace(/^\s+/, '')
+  if (!title) return raw
+  const lines = raw.split('\n')
+  const match = /^#\s+(.*)$/.exec((lines[0] || '').trim())
+  if (!match) return raw
+  const norm = (v) => v.replace(/[*_`~]/g, '').replace(/\s+/g, '').toLowerCase()
+  if (norm(match[1]) !== norm(title)) return raw
+  let i = 1
+  while (i < lines.length && !lines[i].trim()) i += 1
+  return lines.slice(i).join('\n')
+}
+
+function leadExcerpt(markdown, title, maxLen = 140) {
+  const clean = plainText(stripLeadingTitle(markdown, title))
+  if (clean.length <= maxLen) return clean
+  const slice = clean.slice(0, maxLen)
+  const lastBreak = Math.max(
+    slice.lastIndexOf('。'), slice.lastIndexOf('；'), slice.lastIndexOf('，'),
+    slice.lastIndexOf('、'), slice.lastIndexOf(' '),
+  )
+  const cut = lastBreak > Math.floor(maxLen * 0.55) ? slice.slice(0, lastBreak) : slice
+  return cut.replace(/[，、；：,\s]+$/, '') + '…'
+}
+
+function excerpt(text, query, title = '') {
+  const clean = plainText(stripLeadingTitle(text, title))
   const at = clean.toLowerCase().indexOf(query.toLowerCase())
-  if (at < 0) return clean.slice(0, 140) + (clean.length > 140 ? '…' : '')
+  if (at < 0) return leadExcerpt(text, title, 140)
   let start = Math.max(0, at - 50)
   let end = Math.min(clean.length, at + query.length + 80)
   // 按固定字数截断会切在词中间，出现「…与 defer switch 让」这种半截开头。
@@ -400,27 +482,257 @@ app.post('/api/auth/change-password', requireAuth, (req, res) => {
   res.json({ ok: true })
 })
 
+// 各家 OpenAI 兼容服务对 Base URL 的写法并不一致：
+//   讯飞 MaaS 官方文档给的是 .../v2/chat/completions（完整端点）
+//   DeepSeek / OpenAI 给的是 .../v1（版本前缀）
+// OpenAI SDK 会自己再拼 /chat/completions，所以用户照文档粘贴完整端点时
+// 会得到 .../chat/completions/chat/completions 的 404。
+// 这里统一把两种写法都收敛成 SDK 需要的“版本前缀”。
+function normalizeAiEndpoint(baseURL) {
+  let endpoint = baseURL
+  // 用户直接粘了完整端点：去掉尾部 /chat/completions
+  endpoint = endpoint.replace(/\/chat\/completions\/?$/i, '')
+  // 用户粘了 /v1/chat/completions 以外的其它已知端点形式也一并容忍
+  endpoint = endpoint.replace(/\/completions\/?$/i, '')
+  return endpoint.replace(/\/+$/, '')
+}
+
+function validateAiBaseUrl(baseURL) {
+  if (!baseURL) return { ok: true, endpoint: 'https://api.openai.com/v1' }
+  if (typeof baseURL !== 'string' || baseURL.length > 300) {
+    return { ok: false, error: 'Base URL 格式无效' }
+  }
+  try {
+    const url = new URL(baseURL)
+    const host = url.hostname.toLowerCase().replace(/\.$/, '')
+    if (url.protocol !== 'https:' || !host.includes('.') || net.isIP(host) || host.includes(':') ||
+        host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') ||
+        host.endsWith('.internal') || url.username || url.password || url.search || url.hash) {
+      return { ok: false, error: 'Base URL 必须是 HTTPS 域名地址' }
+    }
+    return { ok: true, endpoint: normalizeAiEndpoint(url.toString()) }
+  } catch {
+    return { ok: false, error: 'Base URL 格式无效' }
+  }
+}
+
+function readAiConfig() {
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = 'ai_config'").get()
+  if (!row) return { apiKey: '', model: '', baseURL: '' }
+  try {
+    const parsed = JSON.parse(row.value)
+    return {
+      apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
+      model: typeof parsed.model === 'string' ? parsed.model : '',
+      baseURL: typeof parsed.baseURL === 'string' ? parsed.baseURL : '',
+    }
+  } catch {
+    return { apiKey: '', model: '', baseURL: '' }
+  }
+}
+
+function maskApiKey(key) {
+  if (!key) return ''
+  if (key.length <= 8) return `${key.slice(0, 2)}••••`
+  return `${key.slice(0, 4)}••••${key.slice(-4)}`
+}
+
+function estimateReadingMinutes(text) {
+  const raw = String(text || '')
+  const cjk = (raw.match(/[\u4e00-\u9fa5]/g) || []).length
+  const words = raw.replace(/[\u4e00-\u9fa5]/g, ' ').split(/\s+/).filter(Boolean).length
+  return Math.max(1, Math.round(cjk / 400 + words / 200))
+}
+
+app.get('/api/admin/ai-config', requireCoustea, (_req, res) => {
+  const config = readAiConfig()
+  res.json({
+    config: {
+      model: config.model,
+      baseURL: config.baseURL,
+      hasApiKey: Boolean(config.apiKey),
+      apiKeyHint: maskApiKey(config.apiKey),
+    },
+  })
+})
+
+app.put('/api/admin/ai-config', requireCoustea, (req, res) => {
+  const { apiKey, model, baseURL, clearApiKey } = req.body || {}
+  const prev = readAiConfig()
+  const nextModel = typeof model === 'string' ? model.trim() : prev.model
+  const nextBaseURL = typeof baseURL === 'string' ? baseURL.trim() : prev.baseURL
+  if (nextModel.length > 100) return res.status(400).json({ error: '模型名称长度不能超过 100 字符' })
+  if (nextBaseURL) {
+    const checked = validateAiBaseUrl(nextBaseURL)
+    if (!checked.ok) return res.status(400).json({ error: checked.error })
+  }
+  let nextApiKey = prev.apiKey
+  if (clearApiKey) {
+    nextApiKey = ''
+  } else if (typeof apiKey === 'string' && apiKey.trim()) {
+    if (apiKey.length > 2048) return res.status(400).json({ error: 'API Key 长度无效' })
+    nextApiKey = apiKey.trim()
+  }
+  const value = JSON.stringify({ apiKey: nextApiKey, model: nextModel, baseURL: nextBaseURL })
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_config', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+  `).run(value)
+  res.json({
+    config: {
+      model: nextModel,
+      baseURL: nextBaseURL,
+      hasApiKey: Boolean(nextApiKey),
+      apiKeyHint: maskApiKey(nextApiKey),
+    },
+  })
+})
+
+// 配置连通性自检：用当前（或本次提交的）参数发一次极小的真实请求。
+// 只回显上游是否可达与错误摘要，不返回密钥，也不产生可观的 token 消耗。
+app.post('/api/admin/ai-config/test', requireCoustea, aiLimiter, async (req, res) => {
+  const saved = readAiConfig()
+  const body = req.body || {}
+  const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() ? body.apiKey.trim() : saved.apiKey
+  const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : saved.model
+  const baseURL = typeof body.baseURL === 'string' && body.baseURL.trim() ? body.baseURL.trim() : saved.baseURL
+
+  if (!apiKey || !model) {
+    return res.status(400).json({ error: '请先填写 API Key 与模型名称再测试连接' })
+  }
+  const checkedUrl = validateAiBaseUrl(baseURL)
+  if (!checkedUrl.ok) return res.status(400).json({ error: checkedUrl.error })
+
+  try {
+    const client = new OpenAI({ apiKey, baseURL: checkedUrl.endpoint, timeout: 30000, maxRetries: 0 })
+    const response = await client.chat.completions.create({
+      model,
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 16,
+    })
+    const bizCode = response?.code
+    if (bizCode !== undefined && bizCode !== null && Number(bizCode) !== 0) {
+      const detail = typeof response?.message === 'string' ? response.message : ''
+      return res.status(502).json({
+        error: `上游返回业务错误（${bizCode}）${detail ? `：${detail}` : ''}`,
+        endpoint: checkedUrl.endpoint,
+      })
+    }
+    res.json({
+      ok: true,
+      endpoint: checkedUrl.endpoint,
+      model: response?.model || model,
+      hint: '连接正常，模型可以响应。',
+    })
+  } catch (error) {
+    const upstream = error?.error
+    const upstreamMessage = typeof upstream?.message === 'string' ? upstream.message
+      : typeof upstream?.error?.message === 'string' ? upstream.error.message
+        : typeof error?.message === 'string' ? error.message.replace(/^\d{3}\s+/, '') : ''
+    console.error('AI 连接测试失败', { status: error.status, upstream: upstreamMessage.slice(0, 200) })
+    // 各家对“模型不存在”的状态码并不统一：OpenAI/DeepSeek 用 404，
+    // 讯飞 MaaS 返回 400 + "unsupported model"。所以先看上游文案再退回状态码。
+    const lower = upstreamMessage.toLowerCase()
+    const modelMissing = /unsupported model|model not found|does not exist|invalid model|no such model/.test(lower)
+    const hint = modelMissing ? `模型不可用：请核对模型 ID（上游：${upstreamMessage.slice(0, 120)}）` :
+      error.status === 401 ? '鉴权失败：API Key 无效，或该服务要求不同的鉴权方式' :
+        error.status === 403 ? '被拒绝：该 Key 可能未开通此模型' :
+          error.status === 404 ? '地址或模型不存在：请核对 Base URL 与模型 ID' :
+            error.status === 400 ? `请求被拒绝：${upstreamMessage.slice(0, 120) || '参数或模型名不被接受'}` :
+              error.status === 429 ? '触发限流或额度不足' :
+                error.name === 'APIConnectionTimeoutError' ? '连接超时' : '连接失败'
+    res.status(502).json({ error: hint, detail: upstreamMessage.slice(0, 300), endpoint: checkedUrl.endpoint })
+  }
+})
+
+app.post('/api/ai/markdown', requireCoustea, aiLimiter, async (req, res) => {
+  const saved = readAiConfig()
+  const body = req.body || {}
+  const apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() ? body.apiKey.trim() : saved.apiKey
+  const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : saved.model
+  const baseURL = typeof body.baseURL === 'string' && body.baseURL.trim() ? body.baseURL.trim() : saved.baseURL
+  const { mode, prompt, title, context } = body
+  if (typeof apiKey !== 'string' || !apiKey.trim() || apiKey.length > 2048 ||
+      typeof model !== 'string' || !model.trim() || model.length > 100 ||
+      typeof prompt !== 'string' || !prompt.trim() || prompt.length > 2000 ||
+      typeof title !== 'string' || title.length > 160 ||
+      typeof context !== 'string' || context.length > 12000 ||
+      !['draft', 'continue', 'rewrite'].includes(mode)) {
+    return res.status(400).json({ error: '请检查 API Key、模型、写作要求和正文长度' })
+  }
+
+  const checkedUrl = validateAiBaseUrl(baseURL)
+  if (!checkedUrl.ok) return res.status(400).json({ error: checkedUrl.error })
+  const endpoint = checkedUrl.endpoint
+
+  const task = mode === 'draft' ? '根据主题和要求撰写一段新笔记' :
+    mode === 'continue' ? '接着已有正文续写，不要重复已有内容' :
+      '改写选中的正文，保留原意并满足要求'
+  const input = `标题：${title.trim() || '未命名笔记'}\n任务：${task}\n写作要求：${prompt.trim()}${context ? `\n已有内容：\n${context}` : ''}`
+
+  try {
+    const client = new OpenAI({ apiKey: apiKey.trim(), baseURL: endpoint, timeout: 60000, maxRetries: 0 })
+    const response = await client.chat.completions.create({
+      model: model.trim(),
+      messages: [
+        { role: 'system', content: '你是技术学习笔记写作助手。只输出可直接插入文章的 Markdown 正文，不要用代码围栏包裹整段回答。代码示例要准确；不确定的事实不要编造。' },
+        { role: 'user', content: input },
+      ],
+    })
+    // 讯飞 MaaS / 部分国内兼容服务在 HTTP 200 里返回业务错误码（code 非 0），
+    // OpenAI SDK 不会把它当异常，直接读 choices 会拿到 undefined。
+    // 这里显式识别，避免把“模型不存在”误报成“模型没有返回内容”。
+    const bizCode = response?.code
+    if (bizCode !== undefined && bizCode !== null && Number(bizCode) !== 0) {
+      const detail = typeof response?.message === 'string' ? response.message : ''
+      console.error('AI 上游业务错误', { code: bizCode, message: detail })
+      return res.status(502).json({
+        error: detail
+          ? `AI 服务返回错误（${bizCode}）：${detail}`
+          : `AI 服务返回错误码 ${bizCode}，请检查模型名称与 Base URL`,
+      })
+    }
+    if (response.choices?.[0]?.finish_reason === 'length') {
+      return res.status(502).json({ error: '生成内容达到长度上限，请缩小写作范围后重试' })
+    }
+    const message = response.choices?.[0]?.message
+    // 思考型模型（如 spark-x2.6 默认开启 thinking）可能把内容放进 reasoning_content，
+    // 或者正文为空而只有推理过程。优先取正文，正文为空时退回推理内容，避免误判为空响应。
+    const markdown = (typeof message?.content === 'string' ? message.content : '').trim() ||
+      (typeof message?.reasoning_content === 'string' ? message.reasoning_content : '').trim()
+    if (!markdown) return res.status(502).json({ error: '模型没有返回 Markdown 内容' })
+    res.json({ markdown })
+  } catch (error) {
+    // SDK 会把上游错误体挂在 error.error 上；讯飞/DeepSeek 都用 { message } 或 { error: { message } }
+    const upstream = error?.error
+    const upstreamMessage = typeof upstream?.message === 'string' ? upstream.message
+      : typeof upstream?.error?.message === 'string' ? upstream.error.message
+        : typeof error?.message === 'string' ? error.message.replace(/^\d{3}\s+/, '') : ''
+    console.error('AI 请求失败', {
+      name: error.name, status: error.status, requestId: error.requestID,
+      upstream: upstreamMessage.slice(0, 200),
+    })
+    const lower = upstreamMessage.toLowerCase()
+    const modelMissing = /unsupported model|model not found|does not exist|invalid model|no such model/.test(lower)
+    const message = modelMissing ? `模型不可用，请核对模型 ID（上游：${upstreamMessage}）` :
+      error.status === 401 ? `AI 服务鉴权失败，请检查 API Key${upstreamMessage ? `（${upstreamMessage}）` : ''}` :
+        error.status === 403 ? 'AI 服务拒绝访问，请确认该 Key 已开通所选模型' :
+          error.status === 404 ? '模型或 Base URL 不存在，请检查输入' :
+            error.status === 429 ? 'AI 服务请求受限，请稍后再试' :
+              error.name === 'APIConnectionTimeoutError' ? 'AI 服务响应超时，请稍后再试' :
+                upstreamMessage ? `AI 服务返回错误：${upstreamMessage}` :
+                  'AI 服务暂时不可用，请检查模型和 Base URL'
+    res.status(error.status === 429 ? 429 : error.name === 'APIConnectionTimeoutError' ? 504 : 502).json({ error: message })
+  }
+})
+
 app.get('/api/projects', (req, res) => {
   const uid = req.user ? req.user.id : 0
   const rows = db.prepare(`
-    SELECT p.*,
-      (SELECT COUNT(*) FROM nodes n
-        WHERE n.project_id = p.id AND n.kind = 'doc' AND n.deleted_at IS NULL
-          AND (n.status = 'published' OR n.owner_id = ?)) AS doc_count,
-      (SELECT COUNT(*) FROM nodes n
-        WHERE n.project_id = p.id AND n.kind = 'folder' AND n.deleted_at IS NULL
-          AND (n.status = 'published' OR n.owner_id = ?)) AS folder_count,
-      (SELECT GROUP_CONCAT(n.tags, ',') FROM nodes n
-        WHERE n.project_id = p.id AND n.kind = 'doc' AND n.tags <> '' AND n.deleted_at IS NULL
-          AND (n.status = 'published' OR n.owner_id = ?)) AS tag_blob
-    FROM projects p
-    WHERE p.status = 'published' OR p.owner_id = ?
-    ORDER BY p.sort_order, p.id
-  `).all(uid, uid, uid, uid)
-  const projects = rows.map(({ tag_blob: tagBlob, ...project }) => ({
-    ...project,
-    tags: [...new Set(String(tagBlob || '').split(',').map((tag) => tag.trim()).filter(Boolean))].slice(0, 4),
-  }))
+    SELECT * FROM projects WHERE status = 'published' OR owner_id = ?
+    ORDER BY sort_order, id
+  `).all(uid)
+  const projects = rows.map((project) => projectSummary(project, req.user))
   res.json({ projects })
 })
 
@@ -444,15 +756,11 @@ app.post('/api/projects', requireSiteOwner, (req, res) => {
 })
 
 app.get('/api/projects/:id', (req, res) => {
+  const viewer = req.query.public === '1' ? null : req.user
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)
   if (!project) return res.status(404).json({ error: '项目不存在' })
-  if (!visible(project, req.user)) return res.status(404).json({ error: '项目不存在' })
-  const uid = req.user ? req.user.id : 0
-  const nodes = db.prepare(`
-    SELECT * FROM nodes
-    WHERE project_id = ? AND deleted_at IS NULL AND (status = 'published' OR owner_id = ?)
-    ORDER BY sort_order, id
-  `).all(project.id, uid)
+  if (!visible(project, viewer)) return res.status(404).json({ error: '项目不存在' })
+  const nodes = readableNodes(project, viewer)
   const docCount = nodes.filter((node) => node.kind === 'doc').length
   const folderCount = nodes.filter((node) => node.kind === 'folder').length
   res.json({ project: { ...project, doc_count: docCount, folder_count: folderCount }, nodes })
@@ -469,10 +777,6 @@ app.patch('/api/projects/:id', requireAuth, (req, res) => {
   }
   if (next.status && !['draft', 'published'].includes(next.status)) {
     return res.status(400).json({ error: '状态值无效' })
-  }
-  if (next.status === 'published') {
-    db.prepare('UPDATE nodes SET status = ? WHERE project_id = ? AND owner_id = ? AND deleted_at IS NULL')
-      .run('published', row.id, req.user.id)
   }
   if (Object.keys(next).length) {
     const set = Object.keys(next).map((key) => `${key} = ?`).join(', ')
@@ -497,12 +801,7 @@ app.post('/api/nodes', requireAuth, (req, res) => {
   const kind = req.body.kind === 'folder' ? 'folder' : 'doc'
   const title = String(req.body.title || '').trim() || (kind === 'folder' ? '新建文件夹' : '未命名笔记')
   const parentId = Number(req.body.parentId || 0)
-  if (parentId) {
-    const parent = db.prepare('SELECT * FROM nodes WHERE id = ?').get(parentId)
-    if (!parent || parent.project_id !== project.id) {
-      return res.status(400).json({ error: '父目录不属于该项目' })
-    }
-  }
+  if (!validParent(project.id, parentId)) return res.status(400).json({ error: '父目录无效' })
   const slug = slugify(req.body.slug || title) || `node-${Date.now()}`
   const status = req.body.status === 'published' ? 'published' : 'draft'
   // 学习日：默认记在今天，导入历史笔记时可以指定，用于「今日/打卡」统计
@@ -521,9 +820,28 @@ app.post('/api/nodes', requireAuth, (req, res) => {
 
 app.get('/api/nodes/:id', (req, res) => {
   const row = db.prepare('SELECT * FROM nodes WHERE id = ?').get(req.params.id)
-  if (!row || row.deleted_at) return res.status(404).json({ error: '内容不存在' })
-  if (!visible(row, req.user)) return res.status(404).json({ error: '内容不存在' })
+  if (!row || !visibleNode(row, req.user)) return res.status(404).json({ error: '内容不存在' })
   res.json({ node: row })
+})
+
+app.get('/api/nodes/:id/revisions', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM nodes WHERE id = ? AND deleted_at IS NULL').get(req.params.id)
+  if (!row) return res.status(404).json({ error: '内容不存在' })
+  if (!assertOwner(row, req.user, res)) return
+  const revisions = db.prepare(`
+    SELECT id, title, created_at FROM node_revisions WHERE node_id = ? ORDER BY id DESC
+  `).all(row.id)
+  res.json({ revisions })
+})
+
+app.get('/api/nodes/:id/revisions/:revisionId', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM nodes WHERE id = ? AND deleted_at IS NULL').get(req.params.id)
+  if (!row) return res.status(404).json({ error: '内容不存在' })
+  if (!assertOwner(row, req.user, res)) return
+  const revision = db.prepare('SELECT * FROM node_revisions WHERE node_id = ? AND id = ?')
+    .get(row.id, req.params.revisionId)
+  if (!revision) return res.status(404).json({ error: '历史版本不存在' })
+  res.json({ revision })
 })
 
 app.patch('/api/nodes/:id', requireAuth, (req, res) => {
@@ -544,9 +862,9 @@ app.patch('/api/nodes/:id', requireAuth, (req, res) => {
   if (next.daily_date !== undefined) {
     next.daily_date = normalizeDate(next.daily_date) || today()
   }
-  if (next.parent_id) {
-    const parent = db.prepare('SELECT * FROM nodes WHERE id = ?').get(next.parent_id)
-    if (!parent || parent.project_id !== row.project_id || parent.id === row.id) {
+  if (next.parent_id !== undefined) {
+    next.parent_id = Number(next.parent_id)
+    if (!validParent(row.project_id, next.parent_id) || next.parent_id === row.id) {
       return res.status(400).json({ error: '父目录无效' })
     }
     if (isDescendant(next.parent_id, row.id)) {
@@ -555,10 +873,52 @@ app.patch('/api/nodes/:id', requireAuth, (req, res) => {
   }
   if (Object.keys(next).length) {
     const set = Object.keys(next).map((key) => `${key} = ?`).join(', ')
-    db.prepare(`UPDATE nodes SET ${set}, updated_at = datetime('now') WHERE id = ?`)
-      .run(...Object.values(next), row.id)
+    db.transaction(() => {
+      if (['title', 'slug', 'content', 'tags'].some((key) => next[key] !== undefined && next[key] !== row[key])) {
+        db.prepare(`
+          INSERT INTO node_revisions (node_id, title, slug, content, tags) VALUES (?, ?, ?, ?, ?)
+        `).run(row.id, row.title, row.slug, row.content, row.tags)
+      }
+      db.prepare(`UPDATE nodes SET ${set}, updated_at = datetime('now') WHERE id = ?`)
+        .run(...Object.values(next), row.id)
+    })()
   }
   touchProject(row.project_id)
+  res.json({ node: db.prepare('SELECT * FROM nodes WHERE id = ?').get(row.id) })
+})
+
+// 文件树拖拽：一次事务里移动节点并重排两侧兄弟节点，避免重复 sort_order。
+app.post('/api/nodes/:id/move', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM nodes WHERE id = ? AND deleted_at IS NULL').get(req.params.id)
+  if (!row) return res.status(404).json({ error: '内容不存在' })
+  if (!assertOwner(row, req.user, res)) return
+  const parentId = Number(req.body.parentId)
+  const beforeId = req.body.beforeId == null ? null : Number(req.body.beforeId)
+  if (!validParent(row.project_id, parentId) || parentId === row.id || isDescendant(parentId, row.id)) {
+    return res.status(400).json({ error: '目标目录无效' })
+  }
+  if (beforeId !== null) {
+    const before = db.prepare('SELECT project_id, parent_id FROM nodes WHERE id = ? AND deleted_at IS NULL').get(beforeId)
+    if (!before || before.project_id !== row.project_id || before.parent_id !== parentId || beforeId === row.id) {
+      return res.status(400).json({ error: '目标位置无效' })
+    }
+  }
+
+  const siblings = (parent) => db.prepare(`
+    SELECT id FROM nodes WHERE project_id = ? AND parent_id = ? AND deleted_at IS NULL ORDER BY sort_order, id
+  `).all(row.project_id, parent).map((item) => item.id)
+  db.transaction(() => {
+    const oldParentId = row.parent_id
+    const oldSiblings = siblings(oldParentId).filter((id) => id !== row.id)
+    const nextSiblings = oldParentId === parentId ? oldSiblings : siblings(parentId)
+    const insertAt = beforeId === null ? nextSiblings.length : nextSiblings.indexOf(beforeId)
+    nextSiblings.splice(insertAt, 0, row.id)
+    db.prepare('UPDATE nodes SET parent_id = ?, updated_at = datetime(\'now\') WHERE id = ?').run(parentId, row.id)
+    const setOrder = db.prepare('UPDATE nodes SET sort_order = ? WHERE id = ?')
+    if (oldParentId !== parentId) oldSiblings.forEach((id, index) => setOrder.run(index, id))
+    nextSiblings.forEach((id, index) => setOrder.run(index, id))
+    touchProject(row.project_id)
+  })()
   res.json({ node: db.prepare('SELECT * FROM nodes WHERE id = ?').get(row.id) })
 })
 
@@ -670,12 +1030,13 @@ function importMarkdownTree({ project, userId, parentId, files, status }) {
   const root = Number(parentId || 0)
   let docs = 0
   const skipped = []
+  let duplicates = 0
 
   const findOrCreateFolder = (parent, title) => {
     const slug = slugify(title) || 'folder'
     const found = db.prepare(`
       SELECT id FROM nodes
-      WHERE project_id = ? AND parent_id = ? AND kind = 'folder' AND slug = ?
+      WHERE project_id = ? AND parent_id = ? AND kind = 'folder' AND slug = ? AND deleted_at IS NULL
     `).get(project.id, parent, slug)
     if (found) return found.id
     const info = db.prepare(`
@@ -694,6 +1055,13 @@ function importMarkdownTree({ project, userId, parentId, files, status }) {
         skipped.push(rel)
         return
       }
+      const sourcePath = `${root}/${[...parts, filename].join('/')}`
+      if (db.prepare(`
+        SELECT id FROM nodes WHERE project_id = ? AND source_path = ? AND deleted_at IS NULL
+      `).get(project.id, sourcePath)) {
+        duplicates += 1
+        return
+      }
       const parsed = matter(String(file.content || ''))
       const meta = parsed.data || {}
       let parent = root
@@ -710,20 +1078,20 @@ function importMarkdownTree({ project, userId, parentId, files, status }) {
       const dailyDate = normalizeDate(meta.date || meta.created || meta.daily)
         || String(meta.date || '').slice(0, 10) || today()
       db.prepare(`
-        INSERT INTO nodes (owner_id, project_id, parent_id, kind, title, slug, content, tags, sort_order, status, daily_date)
-        VALUES (?, ?, ?, 'doc', ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO nodes (owner_id, project_id, parent_id, kind, title, slug, content, tags, sort_order, status, daily_date, source_path)
+        VALUES (?, ?, ?, 'doc', ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         userId, project.id, parent, title,
         slugify(title) || `doc-${Date.now()}-${index}`,
         parsed.content || '', tags, Number.isFinite(order) ? order : index, status,
-        /^\d{4}-\d{2}-\d{2}$/.test(dailyDate) ? dailyDate : today(),
+        /^\d{4}-\d{2}-\d{2}$/.test(dailyDate) ? dailyDate : today(), sourcePath,
       )
       docs += 1
     })
-    touchProject(project.id)
+    if (docs) touchProject(project.id)
   })
   tx()
-  return { imported: docs, skipped }
+  return { imported: docs, skipped, duplicates }
 }
 
 app.post('/api/import', requireSiteOwner, (req, res) => {
@@ -733,12 +1101,14 @@ app.post('/api/import', requireSiteOwner, (req, res) => {
   const files = Array.isArray(req.body.files) ? req.body.files : []
   const invalid = validateImportFiles(files)
   if (invalid) return res.status(400).json({ error: invalid })
+  const parentId = Number(req.body.parentId || 0)
+  if (!validParent(project.id, parentId)) return res.status(400).json({ error: '父目录无效' })
 
   const status = req.body.status === 'published' ? 'published' : 'draft'
   const result = importMarkdownTree({
-    project, userId: req.user.id, parentId: req.body.parentId, files, status,
+    project, userId: req.user.id, parentId, files, status,
   })
-  res.json({ ok: true, imported: result.imported, skipped: result.skipped.length })
+  res.json({ ok: true, imported: result.imported, skipped: result.skipped.length, duplicates: result.duplicates })
 })
 
 // 上传整个文件夹直接建项目：一次请求完成建项目 + 重建多级目录
@@ -791,7 +1161,8 @@ app.post('/api/projects/from-folder', requireSiteOwner, (req, res) => {
 app.get('/api/search', (req, res) => {
   const q = String(req.query.q || '').trim()
   if (!q) return res.json({ query: '', projects: [], notes: [], terms: [] })
-  const uid = visibility(req.user)
+  const viewer = req.query.public === '1' ? null : req.user
+  const uid = visibility(viewer)
 
   // 支持多个关键词：按空白切分，每个词都要命中（AND）。
   // 这样「go 并发」能同时缩小到既有 go 又有并发的笔记，
@@ -813,19 +1184,19 @@ app.get('/api/search', (req, res) => {
     .join(' AND ')
   const noteParams = terms.flatMap((term) => [`%${term}%`, `%${term}%`, `%${term}%`])
   const rows = db.prepare(`
-    SELECT n.id, n.title, n.project_id, n.content, n.tags, n.updated_at, p.name AS project_name
+    SELECT n.*, p.name AS project_name
     FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND (n.status = 'published' OR n.owner_id = ?)
       AND (p.status = 'published' OR p.owner_id = ?)
       AND ${noteWhere}
-    ORDER BY n.updated_at DESC LIMIT 100
-  `).all(uid, uid, ...noteParams)
+    ORDER BY n.updated_at DESC
+  `).all(uid, uid, ...noteParams).filter((row) => visibleNode(row, viewer)).slice(0, 100)
 
   const notes = rows.map((row) => ({
     ...row,
     // 摘要围绕第一个词截取，多个词时用第一个最有区分度的
-    excerpt: excerpt(row.content, terms[0]),
+    excerpt: excerpt(row.content, terms[0], row.title),
   }))
   res.json({ query: q, projects, notes, terms })
 })
@@ -833,11 +1204,12 @@ app.get('/api/search', (req, res) => {
 app.get('/api/tags', (req, res) => {
   const uid = visibility(req.user)
   const rows = db.prepare(`
-    SELECT n.tags FROM nodes n JOIN projects p ON p.id = n.project_id
+    SELECT n.id, n.owner_id, n.project_id, n.parent_id, n.status, n.deleted_at, n.tags
+    FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND (n.status = 'published' OR n.owner_id = ?)
       AND (p.status = 'published' OR p.owner_id = ?)
-  `).all(uid, uid)
+  `).all(uid, uid).filter((row) => visibleNode(row, req.user))
   const counts = new Map()
   for (const row of rows) {
     for (const tag of String(row.tags || '').split(',').map((t) => t.trim()).filter(Boolean)) {
@@ -851,17 +1223,65 @@ app.get('/api/tags', (req, res) => {
 })
 
 app.get('/api/recent', (req, res) => {
-  const uid = visibility(req.user)
+  const viewer = req.query.public === '1' ? null : req.user
+  const uid = visibility(viewer)
   const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100)
   const notes = db.prepare(`
-    SELECT n.id, n.title, n.project_id, n.tags, n.updated_at, p.name AS project_name
+    SELECT n.*, p.name AS project_name
     FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND (n.status = 'published' OR n.owner_id = ?)
       AND (p.status = 'published' OR p.owner_id = ?)
-    ORDER BY n.updated_at DESC LIMIT ?
-  `).all(uid, uid, limit)
+    ORDER BY n.updated_at DESC
+  `).all(uid, uid).filter((row) => visibleNode(row, viewer)).slice(0, limit).map((row) => ({
+    ...row,
+    excerpt: leadExcerpt(row.content, row.title, 140),
+    reading_minutes: estimateReadingMinutes(row.content),
+  }))
   res.json({ notes })
+})
+
+app.get('/api/admin/notes', requireCoustea, (req, res) => {
+  const notes = db.prepare(`
+    SELECT n.id, n.project_id, n.title, n.tags, n.status, n.daily_date, n.created_at, n.updated_at,
+           p.name AS project_name, p.status AS project_status
+    FROM nodes n JOIN projects p ON p.id = n.project_id
+    WHERE n.owner_id = ? AND n.kind = 'doc' AND n.deleted_at IS NULL
+    ORDER BY n.updated_at DESC, n.id DESC
+  `).all(req.user.id)
+  res.json({ notes })
+})
+
+app.post('/api/admin/notes/batch', requireCoustea, (req, res) => {
+  const { ids, action } = req.body || {}
+  if (!Array.isArray(ids) || !ids.length || ids.length > 200) {
+    return res.status(400).json({ error: '请选择要操作的文章（单次最多 200 篇）' })
+  }
+  if (!['publish', 'draft', 'trash'].includes(action)) {
+    return res.status(400).json({ error: '不支持的批量操作' })
+  }
+  const uniqueIds = [...new Set(ids.map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))]
+  if (!uniqueIds.length) return res.status(400).json({ error: '文章 ID 无效' })
+
+  const touchedProjects = new Set()
+  let affected = 0
+  const now = new Date().toISOString()
+  db.transaction(() => {
+    for (const id of uniqueIds) {
+      const row = db.prepare("SELECT id, project_id FROM nodes WHERE id = ? AND owner_id = ? AND kind = 'doc' AND deleted_at IS NULL").get(id, req.user.id)
+      if (!row) continue
+      if (action === 'trash') {
+        trashTree(row.id, now)
+      } else {
+        db.prepare("UPDATE nodes SET status = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(action === 'publish' ? 'published' : 'draft', row.id)
+      }
+      touchedProjects.add(row.project_id)
+      affected += 1
+    }
+    for (const pid of touchedProjects) touchProject(pid)
+  })()
+  res.json({ ok: true, affected })
 })
 
 // 「今日学习」视角：当天写了什么、连续写了多少天、最近一段时间的打卡密度。
@@ -975,16 +1395,13 @@ app.delete('/api/uploads/:owner/:file', requireAuth, (req, res) => {
 })
 
 app.get('/api/site', (req, res) => {
-  const uid = visibility(req.user)
+  const viewer = req.query.public === '1' ? null : req.user
+  const uid = visibility(viewer)
   const projectCount = db.prepare(
     "SELECT COUNT(*) AS c FROM projects WHERE status = 'published' OR owner_id = ?",
   ).get(uid).c
-  const noteCount = db.prepare(`
-    SELECT COUNT(*) AS c FROM nodes n JOIN projects p ON p.id = n.project_id
-    WHERE n.kind = 'doc' AND n.deleted_at IS NULL
-      AND (n.status = 'published' OR n.owner_id = ?)
-      AND (p.status = 'published' OR p.owner_id = ?)
-  `).get(uid, uid).c
+  const noteCount = db.prepare("SELECT * FROM projects WHERE status = 'published' OR owner_id = ?")
+    .all(uid).reduce((sum, project) => sum + projectSummary(project, viewer).doc_count, 0)
   res.json({
     site: {
       name: SITE_NAME,
@@ -1020,42 +1437,41 @@ function dailySummary(uid, date = today()) {
 
 // 首页一次拿齐：站点信息、项目、最近笔记、标签与合计，避免首屏连发 4 个请求
 app.get('/api/overview', (req, res) => {
-  const uid = visibility(req.user)
+  const viewer = req.query.public === '1' ? null : req.user
+  const uid = visibility(viewer)
   const projectRows = db.prepare(`
-    SELECT p.*,
-      (SELECT COUNT(*) FROM nodes n
-        WHERE n.project_id = p.id AND n.kind = 'doc' AND n.deleted_at IS NULL
-          AND (n.status = 'published' OR n.owner_id = ?)) AS doc_count,
-      (SELECT COUNT(*) FROM nodes n
-        WHERE n.project_id = p.id AND n.kind = 'folder' AND n.deleted_at IS NULL
-          AND (n.status = 'published' OR n.owner_id = ?)) AS folder_count,
-      (SELECT GROUP_CONCAT(n.tags, ',') FROM nodes n
-        WHERE n.project_id = p.id AND n.kind = 'doc' AND n.tags <> '' AND n.deleted_at IS NULL
-          AND (n.status = 'published' OR n.owner_id = ?)) AS tag_blob
-    FROM projects p
-    WHERE p.status = 'published' OR p.owner_id = ?
-    ORDER BY p.sort_order, p.id
-  `).all(uid, uid, uid, uid)
-  const projects = projectRows.map(({ tag_blob: tagBlob, ...project }) => ({
-    ...project,
-    tags: [...new Set(String(tagBlob || '').split(',').map((tag) => tag.trim()).filter(Boolean))].slice(0, 4),
-  }))
+    SELECT * FROM projects WHERE status = 'published' OR owner_id = ?
+    ORDER BY sort_order, id
+  `).all(uid)
+  const projects = projectRows.map((project) => projectSummary(project, viewer))
 
   const recent = db.prepare(`
-    SELECT n.id, n.title, n.project_id, n.tags, n.updated_at, p.name AS project_name
+    SELECT n.id, n.owner_id, n.project_id, n.parent_id, n.title, n.content, n.tags, n.status, n.deleted_at, n.updated_at,
+           p.name AS project_name
     FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND (n.status = 'published' OR n.owner_id = ?)
       AND (p.status = 'published' OR p.owner_id = ?)
-    ORDER BY n.updated_at DESC LIMIT 6
-  `).all(uid, uid)
+    ORDER BY n.updated_at DESC
+  `).all(uid, uid).filter((row) => visibleNode(row, viewer)).slice(0, 18).map((row) => ({
+    id: row.id,
+    project_id: row.project_id,
+    project_name: row.project_name,
+    title: row.title,
+    tags: row.tags,
+    status: row.status,
+    updated_at: row.updated_at,
+    excerpt: leadExcerpt(row.content, row.title, 140),
+    reading_minutes: estimateReadingMinutes(row.content),
+  }))
 
   const tagRows = db.prepare(`
-    SELECT n.tags FROM nodes n JOIN projects p ON p.id = n.project_id
+    SELECT n.id, n.owner_id, n.project_id, n.parent_id, n.status, n.deleted_at, n.tags
+    FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND (n.status = 'published' OR n.owner_id = ?)
       AND (p.status = 'published' OR p.owner_id = ?)
-  `).all(uid, uid)
+  `).all(uid, uid).filter((row) => visibleNode(row, viewer))
   const counts = new Map()
   for (const row of tagRows) {
     for (const tag of String(row.tags || '').split(',').map((t) => t.trim()).filter(Boolean)) {
@@ -1084,14 +1500,12 @@ app.get('/api/overview', (req, res) => {
 
 function publishedNotes(limit) {
   return db.prepare(`
-    SELECT n.id, n.title, n.content, n.tags, n.updated_at, n.created_at,
-           n.project_id, p.name AS project_name
+    SELECT n.*, p.name AS project_name
     FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND n.status = 'published' AND p.status = 'published'
     ORDER BY n.updated_at DESC, n.id DESC
-    LIMIT ?
-  `).all(limit)
+  `).all().filter((row) => visibleNode(row, null)).slice(0, limit)
 }
 
 app.get('/rss.xml', (req, res) => {
@@ -1128,11 +1542,12 @@ app.get('/sitemap.xml', (req, res) => {
     "SELECT id, updated_at FROM projects WHERE status = 'published' ORDER BY id",
   ).all()
   const notes = db.prepare(`
-    SELECT n.id, n.project_id, n.updated_at FROM nodes n JOIN projects p ON p.id = n.project_id
+    SELECT n.id, n.owner_id, n.project_id, n.parent_id, n.status, n.deleted_at, n.updated_at
+    FROM nodes n JOIN projects p ON p.id = n.project_id
     WHERE n.kind = 'doc' AND n.deleted_at IS NULL
       AND n.status = 'published' AND p.status = 'published'
     ORDER BY n.project_id, n.id
-  `).all()
+  `).all().filter((row) => visibleNode(row, null))
 
   const urls = [
     { loc: `${base}/`, priority: '1.0' },
@@ -1164,11 +1579,9 @@ app.get('/robots.txt', (req, res) => {
   res.type('text/plain').send([
     'User-agent: *',
     'Allow: /',
+    'Disallow: /admin',
     'Disallow: /edit',
     'Disallow: /login',
-    'Disallow: /settings',
-    'Disallow: /trash',
-    'Disallow: /daily',
     'Disallow: /api/',
     '',
     `Sitemap: ${base}/sitemap.xml`,

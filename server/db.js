@@ -35,46 +35,47 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 CREATE TABLE IF NOT EXISTS nodes (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  owner_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  parent_id  INTEGER NOT NULL DEFAULT 0,
-  kind       TEXT NOT NULL CHECK (kind IN ('folder', 'doc')),
-  title      TEXT NOT NULL,
-  slug       TEXT NOT NULL DEFAULT '',
-  content    TEXT NOT NULL DEFAULT '',
-  tags       TEXT NOT NULL DEFAULT '',
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  status     TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  parent_id   INTEGER NOT NULL DEFAULT 0,
+  kind        TEXT NOT NULL CHECK (kind IN ('folder', 'doc')),
+  title       TEXT NOT NULL,
+  slug        TEXT NOT NULL DEFAULT '',
+  content     TEXT NOT NULL DEFAULT '',
+  tags        TEXT NOT NULL DEFAULT '',
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  status      TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+  deleted_at  TEXT,
+  daily_date  TEXT NOT NULL DEFAULT '',
+  source_path TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_project ON nodes (project_id, parent_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_nodes_updated ON nodes (kind, status, updated_at DESC);
-`)
-
-// 轻量迁移：老库补列，新库直接跳过。SQLite 的 ADD COLUMN 幂等性靠列名检查保证。
-function ensureColumn(table, column, definition) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all()
-  if (columns.some((item) => item.name === column)) return
-  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
-}
-
-// deleted_at：软删除时间戳，NULL 表示未删除。回收站与误删恢复都靠它。
-ensureColumn('nodes', 'deleted_at', 'TEXT')
-// daily_date：笔记归属的学习日（YYYY-MM-DD），用于「今日/打卡」统计；老笔记按创建日回填。
-ensureColumn('nodes', 'daily_date', "TEXT NOT NULL DEFAULT ''")
-
-db.exec(`
 CREATE INDEX IF NOT EXISTS idx_nodes_deleted ON nodes (deleted_at);
 CREATE INDEX IF NOT EXISTS idx_nodes_daily ON nodes (owner_id, daily_date);
-`)
+CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes (project_id, source_path);
 
-db.prepare(`
-  UPDATE nodes SET daily_date = date(created_at, 'localtime')
-  WHERE daily_date = '' AND kind = 'doc'
-`).run()
+CREATE TABLE IF NOT EXISTS node_revisions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id    INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  title      TEXT NOT NULL,
+  slug       TEXT NOT NULL,
+  content    TEXT NOT NULL,
+  tags       TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_node_revisions ON node_revisions (node_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`)
 
 /** 关闭前把 WAL 合并回主库，备份脚本可以直接复制 notes.db */
 function closeDatabase() {
