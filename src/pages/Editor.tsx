@@ -1,17 +1,40 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
+import { useAuth } from '../auth'
 import { useTheme } from '../theme'
 import { usePageMeta } from '../site'
 import MarkdownView from '../components/MarkdownView'
+import ProjectFileTree from '../components/ProjectFileTree'
+import MarkdownAssistant from '../components/MarkdownAssistant'
 import Icon from '../components/Icon'
+import type { NoteNode } from '../types'
 
 function insertAt(text: string, snippet: string, start: number, end: number) {
   const next = `${text.slice(0, start)}${snippet}${text.slice(end)}`
   return { next, caret: start + snippet.length }
 }
 
+/** 简单解析导入 .md 文件顶部的 YAML frontmatter（title / tags） */
+function parseFrontmatter(raw: string) {
+  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
+  if (!match) return { title: '', tags: '', body: raw }
+  const meta = match[1]
+  const body = match[2]
+  const titleMatch = meta.match(/^title:\s*(.+)$/m)
+  const tagsMatch = meta.match(/^tags:\s*(.+)$/m)
+  const clean = (s: string) => s.trim().replace(/^['"]|['"]$/g, '')
+  const tagsRaw = tagsMatch ? tagsMatch[1].trim().replace(/^\[|\]$/g, '') : ''
+  const tags = tagsRaw ? tagsRaw.split(',').map((t) => clean(t)).filter(Boolean).join(', ') : ''
+  return {
+    title: titleMatch ? clean(titleMatch[1]) : '',
+    tags,
+    body,
+  }
+}
+
 export default function Editor() {
+  const { user } = useAuth()
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { resolved } = useTheme()
@@ -19,56 +42,51 @@ export default function Editor() {
   const projectId = Number(searchParams.get('projectId') || 0)
   const parentId = Number(searchParams.get('parentId') || 0)
   const dailyDate = searchParams.get('dailyDate') || ''
+  const fromPath = searchParams.get('from') || ''
+  const initialTitle = searchParams.get('title') || ''
+  const initialStatus = searchParams.get('status') === 'draft' ? 'draft' : 'published'
 
   const [kind, setKind] = useState<'folder' | 'doc'>(searchParams.get('kind') === 'folder' ? 'folder' : 'doc')
-  const [title, setTitle] = useState('')
+  const [title, setTitle] = useState(initialTitle)
   const [slug, setSlug] = useState('')
   const [content, setContent] = useState('')
   const [tags, setTags] = useState('')
-  const [sortOrder, setSortOrder] = useState(0)
-  const [status, setStatus] = useState<'draft' | 'published'>('published')
+  const [status, setStatus] = useState<'draft' | 'published'>(initialStatus)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
+  const [savedAt, setSavedAt] = useState('')
   const [uploading, setUploading] = useState(false)
-  const [projectNodes, setProjectNodes] = useState<any[]>([])
+  const [projectNodes, setProjectNodes] = useState<NoteNode[]>([])
   const [nodeProjectId, setNodeProjectId] = useState(0)
   const [parent, setParent] = useState(parentId)
   const [loadingNode, setLoadingNode] = useState(Boolean(nodeId))
-  // 窄屏没有并排的空间，默认只显示编辑区；想对照可以手动切到「并排预览」
+  const [explorerOpen, setExplorerOpen] = useState(false)
   const [mode, setMode] = useState<'write' | 'split'>(
     () => (typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches ? 'write' : 'split'),
   )
   const [dirty, setDirty] = useState(false)
   const [autosavedAt, setAutosavedAt] = useState('')
   const [restorable, setRestorable] = useState<{ title: string; content: string; tags: string; at: string } | null>(null)
+  const [revisions, setRevisions] = useState<{ id: number; title: string; created_at: string }[] | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const mdRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const pid = projectId || nodeProjectId
   const draftKey = `notes_draft_${nodeId || `new-${projectId || 0}-${parentId}`}`
+  const backTarget = fromPath.startsWith('/') ? fromPath : (user?.username === 'coustea' ? '/admin' : (pid ? `/p/${pid}` : '/'))
+  const backLabel = fromPath.startsWith('/admin/projects/') ? '返回项目目录' : user?.username === 'coustea' ? '返回文章管理' : '返回阅读页'
 
   usePageMeta(nodeId ? '编辑内容' : '新建笔记')
 
-  useEffect(() => {
+  const loadTree = useCallback(async () => {
     if (!pid) return
-    api.getProject(pid).then((res) => setProjectNodes(res.nodes)).catch(() => {})
+    const res = await api.getProject(pid)
+    setProjectNodes(res.nodes)
   }, [pid])
 
-  const folderOptions = useMemo(() => {
-    const result: { id: number; label: string }[] = []
-    const walk = (parentValue: number, depth: number) => {
-      projectNodes
-        .filter((n) => n.kind === 'folder' && n.parent_id === parentValue && n.id !== nodeId)
-        .forEach((n) => {
-          result.push({ id: n.id, label: `${'　'.repeat(depth)}${n.title}` })
-          walk(n.id, depth + 1)
-        })
-    }
-    walk(0, 0)
-    return result
-  }, [projectNodes, nodeId])
+  useEffect(() => { loadTree().catch((e) => setError(e.message)) }, [loadTree])
 
-  // 本地草稿：写到 localStorage，刷新或断网都不至于丢内容
   const readDraft = useCallback(() => {
     try {
       const raw = localStorage.getItem(draftKey)
@@ -79,8 +97,12 @@ export default function Editor() {
   }, [draftKey])
 
   useEffect(() => {
+    let cancelled = false
+    setRevisions(null)
+    setHistoryOpen(false)
+    setRestorable(null)
+    setError('')
     if (!nodeId) {
-      // 新建笔记：如果上次有没保存的草稿，提示恢复
       const draft = readDraft()
       if (draft && (draft.content || draft.title)) {
         setRestorable({
@@ -95,17 +117,16 @@ export default function Editor() {
     setLoadingNode(true)
     api.getNode(nodeId)
       .then(({ node }) => {
+        if (cancelled) return
         setTitle(node.title)
         setSlug(node.slug)
         setContent(node.content)
         setTags(node.tags)
-        setSortOrder(node.sort_order)
         setStatus(node.status)
         setKind(node.kind)
         setNodeProjectId(node.project_id)
         setParent(node.parent_id)
         setDirty(false)
-        // 服务器内容比本地草稿新时丢弃草稿，否则提示恢复
         const draft = readDraft()
         if (draft && draft.at && (draft.content || '') !== node.content) {
           setRestorable({
@@ -118,11 +139,11 @@ export default function Editor() {
           localStorage.removeItem(draftKey)
         }
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoadingNode(false))
+      .catch((e) => { if (!cancelled) setError(e.message) })
+      .finally(() => { if (!cancelled) setLoadingNode(false) })
+    return () => { cancelled = true }
   }, [nodeId, readDraft, draftKey])
 
-  // 有改动后每 3 秒把草稿存到本地，不打扰服务器
   useEffect(() => {
     if (!dirty) return
     const timer = window.setTimeout(() => {
@@ -132,13 +153,12 @@ export default function Editor() {
         }))
         setAutosavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }))
       } catch {
-        // 配额满了就放弃本地草稿，不影响正常保存
+        // 配额满时静默忽略本地草稿
       }
     }, 3000)
     return () => window.clearTimeout(timer)
   }, [dirty, title, content, tags, draftKey])
 
-  // 离开页面时提醒，浏览器刷新/关标签页也拦一道
   useEffect(() => {
     if (!dirty) return
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -163,6 +183,30 @@ export default function Editor() {
     setRestorable(null)
   }
 
+  const toggleHistory = async () => {
+    if (historyOpen) { setHistoryOpen(false); return }
+    setHistoryOpen(true)
+    if (revisions) return
+    try {
+      const result = await api.nodeRevisions(nodeId)
+      setRevisions(result.revisions)
+    } catch (e: any) { setError(e.message); setHistoryOpen(false) }
+  }
+
+  const loadRevision = async (revisionId: number) => {
+    if (dirty && !window.confirm('加载历史版本会覆盖当前未保存的修改，确定继续吗？')) return
+    try {
+      const { revision } = await api.nodeRevision(nodeId, revisionId)
+      setTitle(revision.title)
+      setSlug(revision.slug)
+      setContent(revision.content)
+      setTags(revision.tags)
+      setDirty(true)
+      setHistoryOpen(false)
+      setError('')
+    } catch (e: any) { setError(e.message) }
+  }
+
   const uploadAttachment = async (file: File) => {
     if (file.size > 10 * 1024 * 1024) { setError('附件不能超过 10MB'); return }
     setUploading(true)
@@ -185,7 +229,6 @@ export default function Editor() {
     }
   }
 
-  // 直接粘贴截图就上传，省掉「先存文件再选文件」这一步
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(event.clipboardData?.items || [])
     const image = items.find((item) => item.type.startsWith('image/'))
@@ -196,17 +239,17 @@ export default function Editor() {
     uploadAttachment(file)
   }
 
-  // 把一个 .md 文件的内容读进编辑器，等于「上传 md 后继续在线编辑」
   const loadMarkdownFile = async (file: File) => {
     if (file.size > 2 * 1024 * 1024) { setError('单个 Markdown 文件不能超过 2MB'); return }
     if (dirty && !window.confirm('当前有未保存的修改，导入会覆盖正文，确定继续吗？')) return
     try {
-      const text = await file.text()
-      setContent(text)
+      const parsed = parseFrontmatter(await file.text())
+      setContent(parsed.body)
+      if (parsed.tags && !tags.trim()) setTags(parsed.tags)
       if (!title.trim()) {
-        const heading = text.split('\n').map((line) => line.trim()).find((line) => /^#\s+/.test(line))
+        const heading = parsed.body.split('\n').map((line) => line.trim()).find((line) => /^#\s+/.test(line))
         const fallback = file.name.replace(/\.(md|markdown|mdx|txt)$/i, '')
-        setTitle((heading ? heading.replace(/^#\s+/, '') : fallback).slice(0, 120))
+        setTitle((parsed.title || (heading ? heading.replace(/^#\s+/, '') : fallback)).slice(0, 120))
       }
       setDirty(true)
       setError('')
@@ -230,23 +273,44 @@ export default function Editor() {
     }, 0)
   }
 
+  const applyGenerated = (markdown: string, range?: { start: number; end: number }) => {
+    setContent((current) => range
+      ? `${current.slice(0, range.start)}${markdown}${current.slice(range.end)}`
+      : `${current}${current ? current.endsWith('\n\n') ? '' : current.endsWith('\n') ? '\n' : '\n\n' : ''}${markdown}`)
+    setDirty(true)
+  }
+
   const save = async () => {
+    if (loadingNode) return
     if (!title.trim()) { setError('标题不能为空'); return }
     if (!nodeId && !projectId) { setError('缺少项目信息'); return }
     if (saving) return
     setSaving(true)
     setError('')
     try {
-      const payload: Record<string, unknown> = { title, slug, content, tags, sortOrder, status, parentId: parent }
+      const payload: Record<string, unknown> = { title: title.trim(), slug, content, tags, status }
+      if (!nodeId) {
+        payload.parentId = parent
+        payload.sortOrder = Math.max(-1, ...projectNodes.filter((node) => node.parent_id === parent).map((node) => node.sort_order)) + 1
+      }
       if (!nodeId && dailyDate) payload.dailyDate = dailyDate
       const res = nodeId
         ? await api.updateNode(nodeId, payload)
         : await api.createNode({ projectId, kind, ...payload })
       setDirty(false)
+      setAutosavedAt('')
+      setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }))
       localStorage.removeItem(draftKey)
-      navigate(`/p/${res.node.project_id}/n/${res.node.id}`)
+      setNodeProjectId(res.node.project_id)
+      await loadTree()
+      if (!nodeId) {
+        const nextParams = new URLSearchParams({ nodeId: String(res.node.id) })
+        if (fromPath) nextParams.set('from', fromPath)
+        navigate(`/edit?${nextParams.toString()}`, { replace: true })
+      }
     } catch (e: any) {
       setError(e.message)
+    } finally {
       setSaving(false)
     }
   }
@@ -264,33 +328,104 @@ export default function Editor() {
 
   const goBack = () => {
     if (dirty && !window.confirm('还有未保存的修改，确定离开吗？')) return
-    navigate(-1)
+    navigate(backTarget)
   }
 
-  const heading = nodeId ? '编辑内容' : kind === 'folder' ? '新建文件夹' : '新建笔记'
+  const openNode = (target: NoteNode) => {
+    if (target.id === nodeId) return
+    if (dirty && !window.confirm('还有未保存的修改，确定切换笔记吗？')) return
+    const nextParams = new URLSearchParams({ nodeId: String(target.id) })
+    if (fromPath) nextParams.set('from', fromPath)
+    navigate(`/edit?${nextParams.toString()}`)
+  }
+
+  const createInTree = async (targetParent: number, targetKind: 'folder' | 'doc', targetTitle: string) => {
+    if (targetKind === 'doc' && dirty && !window.confirm('还有未保存的修改，确定新建并打开笔记吗？')) throw new Error('已取消新建')
+    try {
+      const sortOrder = Math.max(-1, ...projectNodes.filter((node) => node.parent_id === targetParent).map((node) => node.sort_order)) + 1
+      const { node } = await api.createNode({ projectId: pid, parentId: targetParent, kind: targetKind, title: targetTitle, sortOrder, status: targetKind === 'doc' ? 'draft' : 'published' })
+      await loadTree()
+      if (targetKind === 'doc') {
+        const nextParams = new URLSearchParams({ nodeId: String(node.id) })
+        if (fromPath) nextParams.set('from', fromPath)
+        navigate(`/edit?${nextParams.toString()}`)
+      }
+    } catch (e: any) { setError(e.message); throw e }
+  }
+
+  const moveInTree = async (targetId: number, targetParent: number, beforeId: number | null) => {
+    try {
+      await api.moveNode(targetId, { parentId: targetParent, beforeId })
+      await loadTree()
+    } catch (e: any) { setError(e.message); throw e }
+  }
+
+  const deleteInTree = async (target: NoteNode) => {
+    if (!window.confirm(`删除「${target.title}」${target.kind === 'folder' ? '及其全部子内容' : ''}？可以在回收站里恢复。`)) return
+    try {
+      let current = projectNodes.find((node) => node.id === nodeId)
+      const removingCurrent = (() => {
+        const seen = new Set<number>()
+        while (current && !seen.has(current.id)) {
+          if (current.id === target.id) return true
+          seen.add(current.id)
+          current = projectNodes.find((node) => node.id === current!.parent_id)
+        }
+        return false
+      })()
+      await api.deleteNode(target.id)
+      if (removingCurrent) {
+        localStorage.removeItem(draftKey)
+        setDirty(false)
+        navigate(backTarget)
+      } else {
+        await loadTree()
+      }
+    } catch (e: any) { setError(e.message) }
+  }
+
+  const previewHref = nodeId > 0 && pid > 0
+    ? `/p/${pid}/n/${nodeId}${status === 'draft' ? '?preview=1' : ''}`
+    : ''
 
   return (
     <div className="page editor-page">
       <div className="editor-head">
-        <div>
-          <Link to={pid ? `/p/${pid}` : '/'} className="back-link"><Icon name="arrow-left" size={13} />返回项目</Link>
-          <h1>{heading}</h1>
+        <div className="editor-head-left">
+          <button type="button" onClick={goBack} className="back-link">
+            <Icon name="arrow-left" size={13} />{backLabel}
+          </button>
+          <span className="editor-status-text">
+            {dirty
+              ? (autosavedAt ? `未保存 · 本地草稿 ${autosavedAt}` : '有未保存的修改')
+              : (savedAt ? `已保存于 ${savedAt}` : (nodeId ? '已同步' : '新建笔记'))}
+          </span>
         </div>
         <div className="head-actions">
-          {dirty && (
-            <span className="badge badge-draft" title={autosavedAt ? `本地草稿已存于 ${autosavedAt}` : '本地草稿会自动保存'}>
-              {autosavedAt ? `未保存 · 草稿 ${autosavedAt}` : '未保存'}
-            </span>
+          {pid > 0 && (
+            <button type="button" className="btn btn-sm nav-toggle" aria-expanded={explorerOpen} aria-controls="editor-explorer"
+              onClick={() => setExplorerOpen((open) => !open)}>
+              <Icon name="list" size={15} />目录
+            </button>
           )}
-          <button className="btn" onClick={goBack}>取消</button>
-          <button className="btn btn-primary" onClick={save} disabled={saving}>
+          {nodeId > 0 && kind === 'doc' && (
+            <button type="button" className="btn btn-sm" onClick={toggleHistory} aria-expanded={historyOpen} aria-controls={historyOpen ? 'revision-history' : undefined}>
+              历史版本
+            </button>
+          )}
+          {previewHref && kind === 'doc' && (
+            <Link className="btn btn-sm" to={previewHref}>
+              <Icon name="book-open" size={14} />{status === 'draft' ? '预览草稿' : '查看文章'}
+            </Link>
+          )}
+          <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={saving || loadingNode} title="Cmd/Ctrl + S">
             {saving ? '保存中…' : '保存'}
           </button>
         </div>
       </div>
 
       {error && (
-        <div className="alert">
+        <div className="alert" role="alert">
           <Icon name="warning-circle" size={16} />
           <span>{error}</span>
         </div>
@@ -304,138 +439,176 @@ export default function Editor() {
             {restorable.title ? `「${restorable.title}」` : ''}，要恢复吗？
           </span>
           <div className="draft-restore-actions">
-            <button className="btn btn-sm" onClick={discardDraft}>丢弃</button>
-            <button className="btn btn-sm btn-primary" onClick={applyDraft}>恢复草稿</button>
+            <button type="button" className="btn btn-sm" onClick={discardDraft}>丢弃</button>
+            <button type="button" className="btn btn-sm btn-primary" onClick={applyDraft}>恢复草稿</button>
           </div>
         </div>
       )}
 
-      <div className="editor-fields">
-        <label className="field">
-          <span className="field-label">标题</span>
-          <input
-            className="input"
-            value={title}
-            onChange={(e) => { setTitle(e.target.value); setDirty(true) }}
-            autoFocus
-            placeholder="给这篇起个名字"
-          />
-        </label>
-        <label className="field">
-          <span className="field-label">URL 标识</span>
-          <input className="input" value={slug} onChange={(e) => { setSlug(e.target.value); setDirty(true) }} placeholder="留空则根据标题生成" />
-        </label>
-        <label className="field">
-          <span className="field-label">标签</span>
-          <input className="input" value={tags} onChange={(e) => { setTags(e.target.value); setDirty(true) }} placeholder="用英文逗号分隔，例如：Go, 并发" />
-        </label>
-        {pid > 0 && (
-          <label className="field">
-            <span className="field-label">所在目录</span>
-            <select className="select" value={parent} onChange={(e) => { setParent(Number(e.target.value)); setDirty(true) }}>
-              <option value={0}>根目录</option>
-              {folderOptions.map((folder) => (
-                <option key={folder.id} value={folder.id}>{folder.label}</option>
+      {historyOpen && (
+        <div id="revision-history" className="alert alert-info" style={{ display: 'block' }}>
+          <h2 style={{ fontSize: 16 }}>历史版本</h2>
+          <p>点击版本会加载到编辑器，确认内容后再点“保存”。</p>
+          {revisions === null ? <span>正在读取…</span> : revisions.length === 0 ? <span>还没有旧版本</span> : (
+            <ol style={{ maxHeight: 220, overflowY: 'auto', marginTop: 8 }}>
+              {revisions.map((revision) => (
+                <li key={revision.id} style={{ marginBottom: 8 }}>
+                  <button type="button" className="btn btn-sm" onClick={() => loadRevision(revision.id)}>
+                    {revision.title} · 备份于 {revision.created_at} · #{revision.id}
+                  </button>
+                </li>
               ))}
-            </select>
-          </label>
-        )}
-        <label className="field">
-          <span className="field-label">排序</span>
-          <input className="input" type="number" value={sortOrder} onChange={(e) => { setSortOrder(Number(e.target.value)); setDirty(true) }} />
-        </label>
-        <label className="field">
-          <span className="field-label">状态</span>
-          <select className="select" value={status} onChange={(e) => { setStatus(e.target.value as 'draft' | 'published'); setDirty(true) }}>
-            <option value="published">已发布，访客可见</option>
-            <option value="draft">草稿，只有自己可见</option>
-          </select>
-        </label>
-        {!nodeId && (
-          <label className="field">
-            <span className="field-label">类型</span>
-            <select className="select" value={kind} onChange={(e) => setKind(e.target.value as 'folder' | 'doc')}>
-              <option value="doc">笔记</option>
-              <option value="folder">文件夹</option>
-            </select>
-          </label>
-        )}
-      </div>
-
-      {kind === 'doc' && (
-        <div className="editor-markdown" data-color-mode={resolved}>
-          <div className="editor-toolbar">
-            <div className="edit-tabs">
-              <button className={mode === 'write' ? 'on' : ''} onClick={() => setMode('write')}>写</button>
-              <button className={mode === 'split' ? 'on' : ''} onClick={() => setMode('split')}>并排预览</button>
-            </div>
-            <span className="toolbar-sep" />
-            <div className="format-buttons">
-              <button type="button" className="icon-btn" title="标题" onClick={() => wrapSelection('## ')}>H2</button>
-              <button type="button" className="icon-btn" title="加粗" onClick={() => wrapSelection('**', '**')}>B</button>
-              <button type="button" className="icon-btn" title="行内代码" onClick={() => wrapSelection('`', '`')}>{'</>'}</button>
-              <button type="button" className="icon-btn" title="链接" onClick={() => wrapSelection('[', '](https://)')}>Link</button>
-              <button type="button" className="icon-btn" title="引用" onClick={() => wrapSelection('> ')}>Quote</button>
-            </div>
-            <span className="toolbar-sep" />
-            <button className="btn btn-sm" onClick={() => fileRef.current?.click()} disabled={uploading}>
-              <Icon name="upload" size={14} />
-              {uploading ? '上传中…' : '插图或附件'}
-            </button>
-            <input
-              ref={fileRef}
-              type="file"
-              hidden
-              aria-label="插入图片或附件"
-              accept="image/png,image/jpeg,image/gif,image/webp,application/pdf"
-              onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) uploadAttachment(file)
-                e.target.value = ''
-              }}
-            />
-            <button className="btn btn-sm" onClick={() => mdRef.current?.click()}>
-              <Icon name="file" size={14} />导入 md
-            </button>
-            <input
-              ref={mdRef}
-              type="file"
-              hidden
-              aria-label="导入 Markdown 文件"
-              accept=".md,.markdown,.mdx,.txt,text/markdown,text/plain"
-              onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) loadMarkdownFile(file)
-                e.target.value = ''
-              }}
-            />
-            <span className="hint">可直接粘贴截图上传；PNG / JPEG / GIF / WebP / PDF 单个不超过 10MB</span>
-          </div>
-
-          <div className={`edit-body mode-${mode}`}>
-            {loadingNode ? (
-              <div className="loading-line"><span className="spinner" />正在读取内容…</div>
-            ) : (
-              <>
-                <textarea
-                  ref={textareaRef}
-                  className="edit-textarea"
-                  value={content}
-                  onChange={(e) => { setContent(e.target.value); setDirty(true) }}
-                  onPaste={onPaste}
-                  placeholder="直接用 Markdown 写。支持 GFM 表格、任务列表、代码块，截图可以直接粘贴。"
-                  spellCheck={false}
-                />
-                {mode === 'split' && (
-                  <div className="edit-preview">
-                    <MarkdownView content={content} emptyHint="左侧开始写，这里会实时预览。" />
-                  </div>
-                )}
-              </>
-            )}
-          </div>
+            </ol>
+          )}
         </div>
       )}
+
+      <div className="editor-workspace">
+        {pid > 0 && (
+          <aside id="editor-explorer" className={`editor-explorer side-panel ${explorerOpen ? 'is-open' : ''}`} aria-label="项目文件树">
+            <ProjectFileTree
+              nodes={projectNodes}
+              selectedId={nodeId || null}
+              owner
+              onSelect={openNode}
+              onCreate={createInTree}
+              onMove={moveInTree}
+              onDelete={deleteInTree}
+              onEdit={openNode}
+            />
+          </aside>
+        )}
+
+        <div className="editor-main">
+          <div className="editor-meta-card">
+            <input
+              className="editor-title-input"
+              value={title}
+              onChange={(e) => { setTitle(e.target.value); setDirty(true) }}
+              autoFocus
+              placeholder="输入文章标题…"
+              aria-label="文章标题"
+            />
+            <div className="editor-meta-row">
+              <label className="editor-inline-field">
+                <span>标签</span>
+                <input
+                  className="input"
+                  value={tags}
+                  onChange={(e) => { setTags(e.target.value); setDirty(true) }}
+                  placeholder="英文逗号分隔，如 Go, 并发"
+                />
+              </label>
+              <label className="editor-inline-field editor-status-field">
+                <span>状态</span>
+                <select
+                  className="select"
+                  value={status}
+                  onChange={(e) => { setStatus(e.target.value as 'draft' | 'published'); setDirty(true) }}
+                >
+                  <option value="published">已发布（访客可见）</option>
+                  <option value="draft">草稿（仅自己可见）</option>
+                </select>
+              </label>
+              <details className="editor-advanced">
+                <summary>URL 标识</summary>
+                <input
+                  className="input"
+                  value={slug}
+                  onChange={(e) => { setSlug(e.target.value); setDirty(true) }}
+                  placeholder="留空自动生成"
+                  aria-label="URL 标识"
+                />
+              </details>
+            </div>
+          </div>
+
+          {kind === 'doc' && (
+            <div className="editor-markdown" data-color-mode={resolved}>
+              <div className="editor-toolbar">
+                <div className="edit-tabs">
+                  <button type="button" className={mode === 'write' ? 'on' : ''} onClick={() => setMode('write')}>写</button>
+                  <button type="button" className={mode === 'split' ? 'on' : ''} onClick={() => setMode('split')}>并排预览</button>
+                </div>
+                <span className="toolbar-sep" />
+                <div className="format-buttons">
+                  <button type="button" className="icon-btn" title="二级标题" onClick={() => wrapSelection('## ')}>H2</button>
+                  <button type="button" className="icon-btn" title="加粗" onClick={() => wrapSelection('**', '**')}>加粗</button>
+                  <button type="button" className="icon-btn" title="行内代码" onClick={() => wrapSelection('`', '`')}>代码</button>
+                  <button type="button" className="icon-btn" title="链接" onClick={() => wrapSelection('[', '](https://)')}>链接</button>
+                  <button type="button" className="icon-btn" title="引用" onClick={() => wrapSelection('> ')}>引用</button>
+                </div>
+                <span className="toolbar-sep" />
+                <button type="button" className="btn btn-sm" onClick={() => fileRef.current?.click()} disabled={uploading}>
+                  <Icon name="upload" size={14} />
+                  {uploading ? '上传中…' : '插图或附件'}
+                </button>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  hidden
+                  aria-label="插入图片或附件"
+                  accept="image/png,image/jpeg,image/gif,image/webp,application/pdf"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0]
+                    if (file) uploadAttachment(file)
+                    e.target.value = ''
+                  }}
+                />
+                <button type="button" className="btn btn-sm" onClick={() => mdRef.current?.click()}>
+                  <Icon name="file" size={14} />导入 md
+                </button>
+                <input
+                  ref={mdRef}
+                  type="file"
+                  hidden
+                  aria-label="导入 Markdown 文件"
+                  accept=".md,.markdown,.mdx,.txt,text/markdown,text/plain"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0]
+                    if (file) loadMarkdownFile(file)
+                    e.target.value = ''
+                  }}
+                />
+                <span className="hint">Cmd/Ctrl + S 原地保存 · 可直接粘贴截图</span>
+              </div>
+
+              {!loadingNode && user?.username === 'coustea' && (
+                <MarkdownAssistant
+                  key={nodeId || `new-${projectId}`}
+                  title={title}
+                  content={content}
+                  textareaRef={textareaRef}
+                  onApply={applyGenerated}
+                />
+              )}
+
+              <div className={`edit-body mode-${mode}`}>
+                {loadingNode ? (
+                  <div className="loading-line"><span className="spinner" />正在读取内容…</div>
+                ) : (
+                  <>
+                    <textarea
+                      ref={textareaRef}
+                      className="edit-textarea"
+                      value={content}
+                      onChange={(e) => { setContent(e.target.value); setDirty(true) }}
+                      onPaste={onPaste}
+                      placeholder="直接用 Markdown 写。支持 GFM 表格、任务列表、代码块，截图可以直接粘贴。"
+                      spellCheck={false}
+                    />
+                    {mode === 'split' && (
+                      <div className="edit-preview">
+                        <MarkdownView content={content} emptyHint="左侧开始写，这里会实时预览。" />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   )
 }

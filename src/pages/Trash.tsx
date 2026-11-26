@@ -106,15 +106,15 @@ export default function Trash() {
   }
 
   return (
-    <div className="page">
+    <div className="admin-page">
       <div className="page-title-row">
         <div>
           <h1>回收站</h1>
           <p>删除的笔记与目录会先放在这里，可以随时恢复；彻底删除后不可找回。</p>
         </div>
         <div className="head-actions">
-          <Link className="btn btn-sm" to="/">
-            <Icon name="arrow-left" size={14} />回到项目
+          <Link className="btn btn-sm" to="/admin">
+            <Icon name="arrow-left" size={14} />回到文章管理
           </Link>
           <button className="btn btn-sm btn-danger" onClick={empty} disabled={!total}>
             <Icon name="trash-simple" size={14} />清空回收站

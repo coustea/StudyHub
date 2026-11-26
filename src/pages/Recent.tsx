@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { api } from '../api'
 import { usePageMeta } from '../site'
 import Icon from '../components/Icon'
@@ -10,11 +10,12 @@ interface RecentNote {
   project_id: number
   project_name: string
   tags: string
+  excerpt?: string
+  reading_minutes?: number
   updated_at: string
 }
 
 export default function Recent() {
-  const navigate = useNavigate()
   const [notes, setNotes] = useState<RecentNote[]>([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
@@ -22,7 +23,7 @@ export default function Recent() {
   usePageMeta('最近更新')
 
   useEffect(() => {
-    api.recent(50)
+    api.recent(50, true)
       .then((res) => setNotes(res.notes))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -41,7 +42,7 @@ export default function Recent() {
       <div className="page-title-row">
         <div>
           <h1>最近更新</h1>
-          <p>按更新时间倒序，包含所有你有权限看到的笔记。</p>
+          <p>按更新时间倒序，浏览最新发布的公开笔记。</p>
         </div>
         <Link className="btn btn-sm" to="/search">
           <Icon name="search" size={14} />搜索全部
@@ -85,17 +86,24 @@ export default function Recent() {
           </div>
           <div className="result-list">
             {items.map((note) => (
-              <button
+              <Link
                 key={note.id}
+                to={`/p/${note.project_id}/n/${note.id}`}
                 className="result-row"
-                onClick={() => navigate(`/p/${note.project_id}/n/${note.id}`)}
               >
-                <div className="result-title">{note.title}</div>
-                <div className="result-meta">
-                  <span className="meta-item">{note.project_name}</span>
-                  <span className="meta-item">{note.tags || '无标签'}</span>
+                <div className="result-row-body">
+                  <div className="result-title">{note.title}</div>
+                  {note.excerpt && <div className="result-desc">{note.excerpt}</div>}
+                  <div className="result-meta">
+                    <span className="meta-item result-project">{note.project_name}</span>
+                    {note.reading_minutes ? <span className="meta-item">约 {note.reading_minutes} 分钟</span> : null}
+                    {note.tags && <span className="meta-item">{note.tags}</span>}
+                  </div>
                 </div>
-              </button>
+                <span className="result-arrow" aria-hidden="true">
+                  <Icon name="arrow-up-right" size={15} />
+                </span>
+              </Link>
             ))}
           </div>
         </section>

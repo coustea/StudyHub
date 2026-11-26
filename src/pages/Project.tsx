@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import { usePageMeta, useSite, useStructuredData } from '../site'
-import { readFromFileList } from '../lib/folder'
 import MarkdownView from '../components/MarkdownView'
+import ProjectFileTree from '../components/ProjectFileTree'
 import Icon from '../components/Icon'
 import type { NoteNode, Project as ProjectType } from '../types'
 
@@ -30,105 +30,29 @@ function headingId(text: string) {
     .replace(/\s+/g, '-')
 }
 
-function TreeItem({ node, depth, selectedId, onSelect, owner, onAdd, onDelete }: {
-  node: TreeNode
-  depth: number
-  selectedId: string | null
-  onSelect: (id: number) => void
-  owner: boolean
-  onAdd: (parentId: number, kind: 'folder' | 'doc') => void
-  onDelete: (node: NoteNode) => void
-}) {
-  const [open, setOpen] = useState(true)
-  const isFolder = node.kind === 'folder'
-  const active = selectedId === String(node.id)
-  return (
-    <div>
-      <div
-        className={`tree-row ${active ? 'active' : ''}`}
-        style={{ paddingLeft: 8 + depth * 12 }}
-        onClick={() => (isFolder ? setOpen(!open) : onSelect(node.id))}
-        role="button"
-        tabIndex={0}
-        aria-current={active ? 'page' : undefined}
-        onKeyDown={(event) => {
-          if (event.key !== 'Enter' && event.key !== ' ') return
-          event.preventDefault()
-          if (isFolder) setOpen(!open)
-          else onSelect(node.id)
-        }}
-      >
-        <span className="tree-icon">
-          <Icon name={isFolder ? (open ? 'folder-open' : 'folder') : 'file'} size={14} />
-        </span>
-        <span className="tree-title">{node.title}</span>
-        {node.status === 'draft' && <span className="tree-draft" title="草稿" />}
-        {owner && (
-          <span className="tree-actions">
-            {isFolder && (
-              <button
-                title="在此新建笔记"
-                aria-label={`在 ${node.title} 下新建笔记`}
-                onClick={(event) => { event.stopPropagation(); onAdd(node.id, 'doc') }}
-              >
-                <Icon name="plus" size={13} />
-              </button>
-            )}
-            <button
-              className="is-danger"
-              title="删除"
-              aria-label={`删除 ${node.title}`}
-              onClick={(event) => { event.stopPropagation(); onDelete(node) }}
-            >
-              <Icon name="x" size={13} />
-            </button>
-          </span>
-        )}
-      </div>
-      {isFolder && open && node.children.map((child) => (
-        <TreeItem
-          key={child.id}
-          node={child}
-          depth={depth + 1}
-          selectedId={selectedId}
-          onSelect={onSelect}
-          owner={owner}
-          onAdd={onAdd}
-          onDelete={onDelete}
-        />
-      ))}
-    </div>
-  )
-}
-
 export default function Project() {
   const { id, nodeId } = useParams()
   const { user } = useAuth()
   const site = useSite()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  // 兼容旧的 ?node= 链接，新链接统一走 /p/:id/n/:nodeId
-  const selectedId = nodeId || searchParams.get('node')
+  const isAdmin = user?.username === 'coustea'
+  const preview = isAdmin && searchParams.get('preview') === '1'
+  const previewSuffix = preview ? '?preview=1' : ''
 
   const [project, setProject] = useState<ProjectType | null>(null)
   const [nodes, setNodes] = useState<NoteNode[]>([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
-  const [showImport, setShowImport] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
   const [activeTag, setActiveTag] = useState('')
   const [activeHeading, setActiveHeading] = useState('')
-  const [formName, setFormName] = useState('')
-  const [formDescription, setFormDescription] = useState('')
-  const [formSort, setFormSort] = useState(0)
-  const [notice, setNotice] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const folderRef = useRef<HTMLInputElement | null>(null)
+  const [tocCompact, setTocCompact] = useState(true)
 
-  const load = useCallback(() => api.getProject(id!).then((res) => {
+  const load = useCallback(() => api.getProject(id!, !preview).then((res) => {
     setProject(res.project)
     setNodes(res.nodes)
-  }), [id])
+  }), [id, preview])
 
   useEffect(() => {
     setLoading(true)
@@ -136,27 +60,21 @@ export default function Project() {
     load().catch((e) => setError(e.message)).finally(() => setLoading(false))
   }, [load])
 
-  // 标签面板只统计「本项目」的标签。
-  // 之前直接用了 /api/tags（全站聚合），打开一个空项目也会列出一堆别的项目的标签，
-  // 点进去还会把目录树过滤成空。
   const tags = useMemo(() => {
     const counter = new Map<string, number>()
     nodes.forEach((node) => {
       if (node.kind !== 'doc') return
-      node.tags.split(',').map((tag) => tag.trim()).filter(Boolean).forEach((tag) => {
-        counter.set(tag, (counter.get(tag) || 0) + 1)
-      })
+      node.tags.split(',').map((t) => t.trim()).filter(Boolean).forEach((t) => counter.set(t, (counter.get(t) || 0) + 1))
     })
-    return [...counter.entries()]
-      .map(([tag, count]) => ({ tag, count }))
+    return [...counter.entries()].map(([tag, count]) => ({ tag, count }))
       .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag))
   }, [nodes])
 
   const sourceTree = useMemo(() => buildTree(nodes), [nodes])
-  const selected = nodes.find((n) => n.id === Number(selectedId) && n.kind === 'doc') || null
+  const selected = nodes.find((n) => n.id === Number(nodeId) && n.kind === 'doc') || null
 
-  const tree = useMemo(() => {
-    if (!activeTag) return sourceTree
+  const visibleNodes = useMemo(() => {
+    if (!activeTag) return nodes
     const keep = new Set<number>()
     const mark = (node: NoteNode) => {
       keep.add(node.id)
@@ -168,11 +86,8 @@ export default function Project() {
     nodes.forEach((node) => {
       if (node.kind === 'doc' && node.tags.split(',').map((t) => t.trim()).includes(activeTag)) mark(node)
     })
-    const filter = (items: TreeNode[]): TreeNode[] => items
-      .filter((item) => keep.has(item.id))
-      .map((item) => ({ ...item, children: filter(item.children) }))
-    return filter(sourceTree)
-  }, [activeTag, nodes, sourceTree])
+    return nodes.filter((node) => keep.has(node.id))
+  }, [activeTag, nodes])
 
   const flatDocs = useMemo(() => {
     const result: NoteNode[] = []
@@ -227,92 +142,80 @@ export default function Project() {
   useStructuredData(jsonLd)
 
   useEffect(() => {
-    if (!selectedId && nodes.length) {
+    if (!nodeId && nodes.length) {
       const first = nodes.find((n) => n.kind === 'doc')
-      if (first) navigate(`/p/${id}/n/${first.id}`, { replace: true })
+      if (first) navigate(`/p/${id}/n/${first.id}${previewSuffix}`, { replace: true })
     }
-  }, [nodes, selectedId, id, navigate])
-
-  const owner = !!(user && project && user.id === project.owner_id)
+  }, [nodes, nodeId, id, navigate, previewSuffix])
 
   const headings = useMemo(() => {
     if (!selected) return [] as { level: number; text: string; id: string }[]
     const result: { level: number; text: string; id: string }[] = []
     let inCode = false
-    for (const line of selected.content.split('\n')) {
+    for (const [index, line] of selected.content.trimStart().split('\n').entries()) {
       if (line.trim().startsWith('```')) { inCode = !inCode; continue }
       if (inCode) continue
       const match = line.match(/^(#{1,3})\s+(.*)$/)
       if (match) {
         const text = match[2].replace(/\*\*|`|\[|\]\([^)]*\)/g, '').trim()
+        if (index === 0 && match[1].length === 1 && headingId(text) === headingId(selected.title)) continue
         result.push({ level: match[1].length, text, id: headingId(text) })
       }
     }
     return result
   }, [selected])
 
-  // 目录高亮用 IntersectionObserver，不用 scroll 事件
+  const hasDeepHeadings = useMemo(() => headings.some((h) => h.level >= 3), [headings])
+  const visibleHeadings = useMemo(
+    () => (headings.length > 30 && tocCompact && hasDeepHeadings ? headings.filter((h) => h.level <= 2) : headings),
+    [headings, tocCompact, hasDeepHeadings],
+  )
+
+  useEffect(() => {
+    setTocCompact(headings.length > 30)
+  }, [selected?.id, headings.length])
+
+  useEffect(() => {
+    if (!activeHeading) return
+    const activeEl = document.querySelector(`.toc-panel [data-toc-id="${CSS.escape(activeHeading)}"]`)
+    activeEl?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [activeHeading])
+
   useEffect(() => {
     if (!headings.length) { setActiveHeading(''); return }
-    const targets = headings
-      .map((heading) => document.getElementById(heading.id))
-      .filter((node): node is HTMLElement => Boolean(node))
-    if (!targets.length) return
+    const targets = headings.map((h) => document.getElementById(h.id)).filter((el): el is HTMLElement => Boolean(el))
+    if (!targets.length) { setActiveHeading(headings[0].id); return }
 
-    const observer = new IntersectionObserver((entries) => {
-      const visible = entries
-        .filter((entry) => entry.isIntersecting)
-        .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)
-      if (visible.length) setActiveHeading(visible[0].target.id)
-    }, { rootMargin: '-76px 0px -66% 0px', threshold: [0, 1] })
-
-    targets.forEach((target) => observer.observe(target))
-    return () => observer.disconnect()
+    let raf = 0
+    const sync = () => {
+      raf = 0
+      const scrollBottom = window.scrollY + window.innerHeight
+      const docHeight = document.documentElement.scrollHeight
+      if (docHeight - scrollBottom <= 24) {
+        setActiveHeading(targets[targets.length - 1].id)
+        return
+      }
+      let current = targets[0].id
+      for (const el of targets) {
+        if (el.getBoundingClientRect().top <= 120) current = el.id
+        else break
+      }
+      setActiveHeading(current)
+    }
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(sync) }
+    sync()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      if (raf) cancelAnimationFrame(raf)
+    }
   }, [headings, selected])
 
-  // 切换笔记时回到正文顶部
   useEffect(() => {
     if (!selected) return
     window.scrollTo({ top: 0, behavior: 'auto' })
     setSidebarOpen(false)
   }, [selected?.id])
-
-  const addNode = (parentId: number, kind: 'folder' | 'doc') => {
-    navigate(`/edit?projectId=${project!.id}&parentId=${parentId}&kind=${kind}`)
-  }
-
-  const removeNode = async (node: NoteNode) => {
-    if (!window.confirm(`删除「${node.title}」${node.kind === 'folder' ? '及其全部子内容' : ''}？可以在回收站里恢复。`)) return
-    try {
-      await api.deleteNode(node.id)
-      if (selectedId === String(node.id)) navigate(`/p/${project!.id}`, { replace: true })
-      await load()
-    } catch (e: any) { setError(e.message) }
-  }
-
-  const togglePublish = async () => {
-    if (!project) return
-    try {
-      await api.updateProject(project.id, { status: project.status === 'published' ? 'draft' : 'published' })
-      await load()
-      setNotice(project.status === 'published' ? '项目已转为草稿' : '项目已发布')
-    } catch (e: any) { setError(e.message) }
-  }
-
-  const toggleNodePublish = async () => {
-    if (!selected) return
-    try {
-      await api.updateNode(selected.id, { status: selected.status === 'published' ? 'draft' : 'published' })
-      await load()
-      setNotice(selected.status === 'published' ? '这篇已转为草稿' : '这篇已发布')
-    } catch (e: any) { setError(e.message) }
-  }
-
-  useEffect(() => {
-    if (!notice) return
-    const timer = window.setTimeout(() => setNotice(''), 2600)
-    return () => window.clearTimeout(timer)
-  }, [notice])
 
   const breadcrumb = useMemo(() => {
     if (!selected) return [] as NoteNode[]
@@ -339,56 +242,6 @@ export default function Project() {
     URL.revokeObjectURL(url)
   }
 
-  const openSettings = () => {
-    if (!project) return
-    setFormName(project.name)
-    setFormDescription(project.description)
-    setFormSort(project.sort_order)
-    setShowSettings(true)
-  }
-
-  const saveSettings = async () => {
-    if (!project) return
-    try {
-      await api.updateProject(project.id, {
-        name: formName,
-        description: formDescription,
-        sort_order: formSort,
-      })
-      setShowSettings(false)
-      await load()
-      setNotice('项目信息已保存')
-    } catch (e: any) { setError(e.message) }
-  }
-
-  const removeProject = async () => {
-    if (!project) return
-    if (!window.confirm(`确定删除项目「${project.name}」及其全部笔记？此操作不可撤销。`)) return
-    try {
-      await api.deleteProject(project.id)
-      navigate('/')
-    } catch (e: any) { setError(e.message) }
-  }
-
-  const readFiles = async (list: FileList | null) => {
-    if (!list || !list.length || !project) return
-    const result = await readFromFileList(list)
-    if (!result.files.length) { setError('请选择 .md / .markdown / .mdx / .txt 文件'); return }
-    try {
-      const res = await api.importFiles({
-        projectId: project.id,
-        parentId: 0,
-        status: 'published',
-        files: result.files,
-      })
-      setShowImport(false)
-      setError('')
-      await load()
-      const skipped = result.skipped + (res.skipped || 0)
-      setNotice(`已导入 ${res.imported} 篇笔记${skipped ? `，跳过 ${skipped} 个非笔记文件` : ''}`)
-    } catch (e: any) { setError(e.message) }
-  }
-
   if (loading) {
     return (
       <div className="project-page">
@@ -399,45 +252,18 @@ export default function Project() {
             <div className="skeleton" style={{ height: 12, width: '88%', marginTop: 14 }} />
           </div>
         </div>
-        <div className="workspace">
-          <aside className="side-panel">
-            {[0, 1, 2, 3, 4].map((row) => (
-              <div className="skeleton" key={row} style={{ height: 26, marginBottom: 8, width: `${92 - row * 6}%` }} />
-            ))}
-          </aside>
-          <div className="article">
-            <div className="skeleton" style={{ height: 13, width: 120, marginBottom: 16 }} />
-            <div className="skeleton" style={{ height: 28, width: '72%', marginBottom: 24 }} />
-            {[0, 1, 2, 3, 4, 5].map((row) => (
-              <div className="skeleton" key={row} style={{ height: 12, marginBottom: 12, width: `${94 - (row % 3) * 9}%` }} />
-            ))}
-          </div>
-        </div>
       </div>
     )
   }
 
-  if (error && !project) {
-    return (
-      <div className="page">
-        <div className="empty">
-          <Icon name="warning-circle" size={28} className="empty-icon" />
-          <span className="empty-title">打不开这个项目</span>
-          <p>{error}</p>
-          <Link className="btn" to="/">回到项目列表</Link>
-        </div>
-      </div>
-    )
-  }
-
-  if (!project) {
+  if (error || !project) {
     return (
       <div className="page">
         <div className="empty">
           <Icon name="folder" size={28} className="empty-icon" />
-          <span className="empty-title">项目不存在</span>
-          <p>它可能已被删除，或者还没有发布。</p>
-          <Link className="btn" to="/">回到项目列表</Link>
+          <span className="empty-title">{error ? '打不开这个专题' : '专题不存在'}</span>
+          <p>{error || '它可能已被删除，或者还没有发布。'}</p>
+          <Link className="btn" to="/">回到阅读首页</Link>
         </div>
       </div>
     )
@@ -445,222 +271,201 @@ export default function Project() {
 
   return (
     <div className="project-page">
-      <div className="project-head">
+      {selected && <div className="reading-progress" aria-hidden="true" />}
+      {preview && (
+        <div className="alert alert-info" role="status">
+          <Icon name="book-open" size={16} />
+          <span>草稿预览模式 · 当前包含未发布内容，访客不可见</span>
+          <Link className="link-btn" style={{ marginLeft: 'auto', fontSize: 12.5 }} to="/admin">返回文章管理</Link>
+        </div>
+      )}
+
+      <div className={`project-head ${selected ? 'is-reading' : ''}`}>
         <div className="project-head-main">
-          <Link to="/" className="back-link"><Icon name="arrow-left" size={13} />全部项目</Link>
-          {/* 选中笔记时页面主标题是笔记标题，项目名降级成普通文字，
-              否则一页里会有两个 h1，读屏软件和搜索引擎都分不清谁是主标题 */}
-          {selected
-            ? <div className="project-name">{project.name}</div>
-            : <h1>{project.name}</h1>}
+          <Link to="/" className="back-link"><Icon name="arrow-left" size={13} />笔记首页</Link>
+          {selected ? <div className="project-name">{project.name}</div> : <h1>{project.name}</h1>}
           {project.description && <p className="project-desc">{project.description}</p>}
           <div className="project-facts">
-            <span className="fact">
-              <Icon name="file" size={13} />
-              {project.doc_count ?? nodes.filter((node) => node.kind === 'doc').length} 篇笔记
-            </span>
-            <span className="fact">
-              <Icon name="folder" size={13} />
-              {project.folder_count ?? nodes.filter((node) => node.kind === 'folder').length} 个目录
-            </span>
-            <span className="fact">
-              <Icon name="clock" size={13} />
-              更新于 {String(project.updated_at).slice(0, 10)}
-            </span>
-            <span className="fact">
-              <span className={`badge ${project.status === 'published' ? 'badge-published' : 'badge-draft'}`}>
-                {project.status === 'published' ? '已发布' : '草稿'}
-              </span>
-            </span>
+            <span className="fact"><Icon name="file" size={13} />{project.doc_count ?? nodes.filter((n) => n.kind === 'doc').length} 篇笔记</span>
+            <span className="fact"><Icon name="folder" size={13} />{project.folder_count ?? nodes.filter((n) => n.kind === 'folder').length} 个目录</span>
+            <span className="fact"><Icon name="clock" size={13} />更新于 {String(project.updated_at).slice(0, 10)}</span>
           </div>
         </div>
         <div className="head-actions">
           <button
+            type="button"
             className="btn btn-sm nav-toggle"
             onClick={() => setSidebarOpen((open) => !open)}
-            style={{ display: 'inline-flex' }}
             aria-expanded={sidebarOpen}
+            aria-controls="project-navigation"
           >
             <Icon name="list" size={15} />目录
           </button>
-          {owner && (
-            <>
-              <button className="btn" onClick={() => addNode(0, 'doc')}>
-                <Icon name="plus" size={15} />新建笔记
-              </button>
-              <button className="btn" onClick={() => setShowImport(true)}>
-                <Icon name="upload" size={15} />导入
-              </button>
-              <button className="btn" onClick={togglePublish}>
-                {project.status === 'published' ? '转为草稿' : '发布项目'}
-              </button>
-              <button className="icon-btn" onClick={openSettings} aria-label="项目设置" title="项目设置">
-                <Icon name="gear" size={17} />
-              </button>
-            </>
+          {isAdmin && (
+            <Link className="btn btn-sm" to={`/admin/projects/${project.id}`}>
+              <Icon name="gear" size={14} />管理目录
+            </Link>
           )}
         </div>
       </div>
 
-      {error && (
-        <div className="alert">
-          <Icon name="warning-circle" size={16} />
-          <span>{error}</span>
-          <button className="link-btn" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={() => setError('')}>关闭</button>
-        </div>
-      )}
-      {notice && (
-        <div className="alert alert-info">
-          <Icon name="check-circle" size={16} />
-          <span>{notice}</span>
-        </div>
-      )}
-
       <div className="workspace">
-        <aside className="side-panel">
-          <div className="tag-panel">
-            <div className="panel-label">
-              <span>标签</span>
-              {activeTag && (
-                <button className="link-btn" style={{ fontSize: 11 }} onClick={() => setActiveTag('')}>重置</button>
-              )}
-            </div>
-            <div className="tag-chips">
-              <button className={`chip ${activeTag === '' ? 'on' : ''}`} onClick={() => setActiveTag('')}>全部</button>
-              {tags.map((tag) => (
-                <button
-                  key={tag.tag}
-                  className={`chip ${activeTag === tag.tag ? 'on' : ''}`}
-                  onClick={() => setActiveTag(activeTag === tag.tag ? '' : tag.tag)}
-                >
-                  {tag.tag}<span className="chip-count">{tag.count}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="panel-label">
-            <span>目录</span>
-            <span className="count">{flatDocs.length}</span>
-          </div>
-          <div className="tree-scroll">
-            {tree.length ? tree.map((node) => (
-              <TreeItem
-                key={node.id}
-                node={node}
-                depth={0}
-                selectedId={selectedId}
-                onSelect={(targetId) => navigate(`/p/${project.id}/n/${targetId}`)}
-                owner={owner}
-                onAdd={addNode}
-                onDelete={removeNode}
-              />
-            )) : <div className="dim" style={{ padding: '10px 8px', fontSize: 12.5 }}>还没有内容</div>}
-          </div>
-
-          {owner && (
-            <div className="side-foot">
-              <button className="link-btn" style={{ fontSize: 12.5 }} onClick={() => addNode(0, 'folder')}>
-                <Icon name="plus" size={13} />新建文件夹
-              </button>
+        <aside id="project-navigation" className={`side-panel project-nav ${sidebarOpen ? 'is-open' : ''}`} aria-label="专题目录">
+          {tags.length > 0 && (
+            <div className="tag-panel">
+              <div className="panel-label">
+                <span>标签</span>
+                {activeTag && <button type="button" className="link-btn" style={{ fontSize: 11 }} onClick={() => setActiveTag('')}>重置</button>}
+              </div>
+              <div className="tag-chips">
+                <button type="button" className={`chip ${activeTag === '' ? 'on' : ''}`} onClick={() => setActiveTag('')}>全部</button>
+                {tags.map((item) => (
+                  <button
+                    key={item.tag}
+                    type="button"
+                    className={`chip ${activeTag === item.tag ? 'on' : ''}`}
+                    onClick={() => setActiveTag(activeTag === item.tag ? '' : item.tag)}
+                  >
+                    {item.tag}<span className="chip-count">{item.count}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
+
+          <ProjectFileTree
+            nodes={visibleNodes}
+            selectedId={selected ? selected.id : null}
+            owner={false}
+            onSelect={(node) => navigate(`/p/${project.id}/n/${node.id}${previewSuffix}`)}
+            onCreate={async () => {}}
+            onMove={async () => {}}
+            onDelete={async () => {}}
+            onEdit={() => {}}
+          />
         </aside>
 
         <article className="article">
           {selected ? (
             <>
               <div className="article-head">
-                <div className="breadcrumb">
-                  <Link to={`/p/${project.id}`}>{project.name}</Link>
-                  {breadcrumb.slice(1).map((crumb) => (
-                    <span key={crumb.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                      <span className="sep">/</span>
-                      <span>{crumb.title}</span>
-                    </span>
-                  ))}
-                </div>
+                {breadcrumb.length > 1 && (
+                  <div className="breadcrumb">
+                    <Link to={`/p/${project.id}${previewSuffix}`}>{project.name}</Link>
+                    {breadcrumb.slice(1).map((crumb) => (
+                      <span key={crumb.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                        <span className="sep">/</span>
+                        <span>{crumb.title}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <h1>{selected.title}</h1>
                 <div className="article-meta">
                   <span className="meta-item">更新于 {String(selected.updated_at).slice(0, 10)}</span>
                   <span className="meta-item">约 {readingMinutes} 分钟</span>
-                  {selected.tags && selected.tags.split(',').filter(Boolean).length > 0 && (
-                    <span className="meta-item">标签 {selected.tags}</span>
-                  )}
+                  {selected.tags.split(',').map((t) => t.trim()).filter(Boolean).map((tag) => (
+                    <Link key={tag} className="meta-item" to={`/search?q=${encodeURIComponent(tag)}`}>#{tag}</Link>
+                  ))}
                   {selected.status === 'draft' && (
                     <span className="meta-item"><span className="badge badge-draft">草稿</span></span>
                   )}
                 </div>
                 <div className="article-bar">
-                  <button className="btn btn-sm btn-quiet" onClick={exportMarkdown}>
+                  <button type="button" className="btn btn-sm btn-quiet" onClick={exportMarkdown}>
                     <Icon name="upload" size={14} style={{ transform: 'rotate(180deg)' }} />导出 MD
                   </button>
                   <div className="spacer" />
-                  {owner && (
-                    <>
-                      <button className="btn btn-sm" onClick={toggleNodePublish}>
-                        {selected.status === 'published' ? '转为草稿' : '发布此篇'}
-                      </button>
-                      <button className="btn btn-sm btn-primary" onClick={() => navigate(`/edit?nodeId=${selected.id}`)}>
-                        <Icon name="pencil" size={14} />编辑
-                      </button>
-                    </>
+                  {isAdmin && (
+                    <Link className="btn btn-sm" to={`/edit?nodeId=${selected.id}`}>
+                      <Icon name="pencil" size={14} />编辑此篇
+                    </Link>
                   )}
                 </div>
+                {visibleHeadings.length > 0 && (
+                  <details className="mobile-toc">
+                    <summary>
+                      <span>本页目录</span>
+                      <span className="count">{visibleHeadings.length}{visibleHeadings.length !== headings.length ? `/${headings.length}` : ''}</span>
+                    </summary>
+                    <div className="mobile-toc-list">
+                      {visibleHeadings.map((heading, index) => (
+                        <button
+                          key={`m-${heading.id}-${index}`}
+                          type="button"
+                          className={`toc-item level-${heading.level} ${activeHeading === heading.id ? 'active' : ''}`}
+                          onClick={(e) => {
+                            const details = e.currentTarget.closest('details')
+                            if (details) details.open = false
+                            setActiveHeading(heading.id)
+                            document.getElementById(heading.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                          }}
+                        >
+                          {heading.text}
+                        </button>
+                      ))}
+                    </div>
+                  </details>
+                )}
               </div>
               <MarkdownView
                 title={selected.title}
                 content={selected.content}
                 stripLeadingTitle
-                emptyHint="_这篇笔记还是空的，点编辑写点什么。_"
+                emptyHint="_这篇笔记暂无正文。_"
               />
               <nav className="article-nav" aria-label="上下篇">
                 {prevDoc ? (
-                  <Link to={`/p/${project.id}/n/${prevDoc.id}`} className="nav-item prev">
+                  <Link to={`/p/${project.id}/n/${prevDoc.id}${previewSuffix}`} className="nav-item prev">
                     <span className="nav-label"><Icon name="arrow-left" size={12} />上一篇</span>
                     <span className="nav-title">{prevDoc.title}</span>
                   </Link>
                 ) : <span className="nav-placeholder" aria-hidden="true" />}
                 {nextDoc ? (
-                  <Link to={`/p/${project.id}/n/${nextDoc.id}`} className="nav-item next">
+                  <Link to={`/p/${project.id}/n/${nextDoc.id}${previewSuffix}`} className="nav-item next">
                     <span className="nav-label">下一篇<Icon name="arrow-up-right" size={12} /></span>
                     <span className="nav-title">{nextDoc.title}</span>
                   </Link>
                 ) : <span className="nav-placeholder" aria-hidden="true" />}
               </nav>
+              <div className="article-top-return">
+                <button type="button" className="link-btn" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>
+                  回到顶部
+                </button>
+              </div>
             </>
           ) : (
             <div className="empty" style={{ border: 0, background: 'transparent' }}>
               <Icon name="book-open" size={28} className="empty-icon" />
-              <span className="empty-title">{nodes.length ? '选一篇开始读' : '这个项目还没有笔记'}</span>
-              <p>
-                {nodes.length
-                  ? '从左侧目录里点一篇笔记，正文会显示在这里。'
-                  : owner
-                    ? '先写第一篇笔记，或者把一个 Markdown 文件夹导入进来。'
-                    : '作者还没有发布内容。'}
-              </p>
-              {owner && !nodes.length && (
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button className="btn btn-primary btn-sm" onClick={() => addNode(0, 'doc')}>新建笔记</button>
-                  <button className="btn btn-sm" onClick={() => setShowImport(true)}>导入 Markdown</button>
-                </div>
-              )}
+              <span className="empty-title">{nodes.length ? '选一篇开始读' : '这个专题还没有笔记'}</span>
+              <p>{nodes.length ? '从左侧目录里点一篇笔记，正文会显示在这里。' : '站长还没有发布内容。'}</p>
             </div>
           )}
         </article>
 
-        <aside className="toc-panel side-panel">
+        <aside className="toc-panel side-panel" aria-label="本页目录">
           <div className="panel-label">
             <span>本页目录</span>
-            <span className="count">{headings.length}</span>
+            <span className="toc-label-right">
+              {headings.length > 30 && hasDeepHeadings && (
+                <button type="button" className="link-btn" style={{ fontSize: 11 }} onClick={() => setTocCompact((v) => !v)}>
+                  {tocCompact ? '展开全部' : '只看大纲'}
+                </button>
+              )}
+              <span className="count">{visibleHeadings.length}{visibleHeadings.length !== headings.length ? `/${headings.length}` : ''}</span>
+            </span>
           </div>
           <div className="tree-scroll">
-            {headings.length ? headings.map((heading, index) => (
+            {visibleHeadings.length ? visibleHeadings.map((heading, index) => (
               <button
+                type="button"
                 key={`${heading.id}-${index}`}
+                data-toc-id={heading.id}
                 className={`toc-item level-${heading.level} ${activeHeading === heading.id ? 'active' : ''}`}
-                onClick={() => document.getElementById(heading.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                onClick={() => {
+                  setActiveHeading(heading.id)
+                  document.getElementById(heading.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                }}
               >
                 {heading.text}
               </button>
@@ -668,95 +473,6 @@ export default function Project() {
           </div>
         </aside>
       </div>
-
-      {showSettings && (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
-          <div className="modal" role="dialog" aria-modal="true" aria-label="项目设置" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <div>
-                <h2>项目设置</h2>
-                <p>改名、改描述、调整排序，或者删除整个项目。</p>
-              </div>
-              <button className="icon-btn" onClick={() => setShowSettings(false)} aria-label="关闭">
-                <Icon name="x" size={16} />
-              </button>
-            </div>
-            <div className="modal-body">
-              <label className="field">
-                <span className="field-label">项目名称</span>
-                <input className="input" value={formName} onChange={(e) => setFormName(e.target.value)} />
-              </label>
-              <label className="field">
-                <span className="field-label">项目描述</span>
-                <textarea className="textarea" value={formDescription} onChange={(e) => setFormDescription(e.target.value)} rows={3} />
-              </label>
-              <label className="field">
-                <span className="field-label">排序</span>
-                <input className="input" type="number" value={formSort} onChange={(e) => setFormSort(Number(e.target.value))} />
-                <span className="field-hint">数字小的排在前面。</span>
-              </label>
-            </div>
-            <div className="modal-actions">
-              <button className="btn btn-danger btn-sm" onClick={removeProject}>
-                <Icon name="trash" size={14} />删除项目
-              </button>
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowSettings(false)}>取消</button>
-              <button className="btn btn-primary" onClick={saveSettings}>保存</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showImport && (
-        <div className="modal-backdrop" onClick={() => setShowImport(false)}>
-          <div className="modal" role="dialog" aria-modal="true" aria-label="导入 Markdown" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <div>
-                <h2>导入 Markdown</h2>
-                <p>解析 frontmatter 里的 title、order、tags，按相对路径重建目录。</p>
-              </div>
-              <button className="icon-btn" onClick={() => setShowImport(false)} aria-label="关闭">
-                <Icon name="x" size={16} />
-              </button>
-            </div>
-            <div className="modal-body">
-              <label className="field">
-                <span className="field-label">选择文件</span>
-                <input
-                  className="input"
-                  type="file"
-                  multiple
-                  accept=".md,.markdown,.mdx,.txt"
-                  onChange={(e) => { readFiles(e.target.files); e.target.value = '' }}
-                />
-                <span className="field-hint">单次最多 300 个文件，单个不超过 2MB。</span>
-              </label>
-              <label className="field">
-                <span className="field-label">或者选择整个文件夹</span>
-                <input
-                  className="input"
-                  ref={(element) => {
-                    folderRef.current = element
-                    if (element) {
-                      element.setAttribute('webkitdirectory', '')
-                      element.setAttribute('directory', '')
-                    }
-                  }}
-                  type="file"
-                  multiple
-                  onChange={(e) => { readFiles(e.target.files); e.target.value = '' }}
-                />
-                <span className="field-hint">会自动跳过 node_modules、隐藏目录与非 Markdown 文件。</span>
-              </label>
-            </div>
-            <div className="modal-actions">
-              <div className="spacer" />
-              <button className="btn" onClick={() => setShowImport(false)}>关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

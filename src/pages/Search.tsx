@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { usePageMeta } from '../site'
 import Icon from '../components/Icon'
@@ -26,7 +26,6 @@ function Highlight({ text, query }: { text: string; query: string }) {
 
 export default function Search() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const navigate = useNavigate()
   const query = searchParams.get('q') || ''
   const [input, setInput] = useState(query)
   const [result, setResult] = useState<{ query: string; projects: any[]; notes: any[] } | null>(null)
@@ -41,7 +40,7 @@ export default function Search() {
     if (!query) { setResult(null); setLoading(false); return }
     setLoading(true)
     setError('')
-    api.search(query)
+    api.search(query, true)
       .then(setResult)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -124,12 +123,17 @@ export default function Search() {
               <div className="result-list">
                 {result.projects.map((project) => (
                   <Link key={project.id} to={`/p/${project.id}`} className="result-row">
-                    <div className="result-title"><Highlight text={project.name} query={query} /></div>
-                    <div className="result-desc"><Highlight text={project.description || '暂无描述'} query={query} /></div>
-                    <div className="result-meta">
-                      <span className="meta-item">项目</span>
-                      <span className="meta-item">更新于 {String(project.updated_at).slice(0, 10)}</span>
+                    <div className="result-row-body">
+                      <div className="result-title"><Highlight text={project.name} query={query} /></div>
+                      <div className="result-desc"><Highlight text={project.description || '暂无描述'} query={query} /></div>
+                      <div className="result-meta">
+                        <span className="meta-item result-project">专题</span>
+                        <span className="meta-item">更新于 {String(project.updated_at).slice(0, 10)}</span>
+                      </div>
                     </div>
+                    <span className="result-arrow" aria-hidden="true">
+                      <Icon name="arrow-up-right" size={15} />
+                    </span>
                   </Link>
                 ))}
               </div>
@@ -144,19 +148,24 @@ export default function Search() {
               </div>
               <div className="result-list">
                 {result.notes.map((note) => (
-                  <button
+                  <Link
                     key={note.id}
+                    to={`/p/${note.project_id}/n/${note.id}`}
                     className="result-row"
-                    onClick={() => navigate(`/p/${note.project_id}/n/${note.id}`)}
                   >
-                    <div className="result-title"><Highlight text={note.title} query={query} /></div>
-                    <div className="result-desc"><Highlight text={note.excerpt} query={query} /></div>
-                    <div className="result-meta">
-                      <span className="meta-item">{note.project_name}</span>
-                      <span className="meta-item">{note.tags || '无标签'}</span>
-                      <span className="meta-item">更新于 {String(note.updated_at).slice(0, 10)}</span>
+                    <div className="result-row-body">
+                      <div className="result-title"><Highlight text={note.title} query={query} /></div>
+                      {note.excerpt && <div className="result-desc"><Highlight text={note.excerpt} query={query} /></div>}
+                      <div className="result-meta">
+                        <span className="meta-item result-project">{note.project_name}</span>
+                        {note.tags && <span className="meta-item">{note.tags}</span>}
+                        <span className="meta-item">更新于 {String(note.updated_at).slice(0, 10)}</span>
+                      </div>
                     </div>
-                  </button>
+                    <span className="result-arrow" aria-hidden="true">
+                      <Icon name="arrow-up-right" size={15} />
+                    </span>
+                  </Link>
                 ))}
               </div>
             </section>

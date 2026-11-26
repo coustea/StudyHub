@@ -180,7 +180,7 @@ export default function Daily() {
   }, [data.calendar, date])
 
   return (
-    <div className="page">
+    <div className="admin-page">
       <div className="page-title-row">
         <div>
           <h1>今日学习</h1>
@@ -237,7 +237,7 @@ export default function Daily() {
             <button className="btn btn-primary" onClick={startNote} disabled={creating}>
               <Icon name="note-pencil" size={15} />{creating ? '正在新建…' : (date === today ? '写今天的学习笔记' : '补写这天的笔记')}
             </button>
-            <Link className="btn" to="/">
+            <Link className="btn" to="/admin/projects">
               <Icon name="folder" size={15} />从项目里新建
             </Link>
           </div>
