@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api } from '../../api'
 import { usePageMeta } from '../../site'
+import { buildFolderOptions } from '../../lib/tree'
 import Icon from '../../components/Icon'
 import { Button } from '../../components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../../components/ui/dialog'
-import type { AdminNote, AiConfig, Project } from '../../types'
+import type { AdminNote, AiConfig, NoteNode, Project } from '../../types'
 
 const formatDate = (value: string) => String(value || '').slice(0, 10)
 
@@ -29,9 +30,21 @@ export default function AdminArticles() {
 
   const [showNew, setShowNew] = useState(false)
   const [newProjectId, setNewProjectId] = useState<number>(0)
+  const [newParentId, setNewParentId] = useState<number>(0)
+  const [newProjectNodes, setNewProjectNodes] = useState<NoteNode[]>([])
   const [newTitle, setNewTitle] = useState('')
   const [newStatus, setNewStatus] = useState<'draft' | 'published'>('published')
   const newTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const newFolderOptions = useMemo(() => buildFolderOptions(newProjectNodes), [newProjectNodes])
+
+  useEffect(() => {
+    if (!showNew || !newProjectId) { setNewProjectNodes([]); return }
+    let cancelled = false
+    api.getProject(newProjectId, false)
+      .then((res) => { if (!cancelled) setNewProjectNodes(res.nodes) })
+      .catch(() => { if (!cancelled) setNewProjectNodes([]) })
+    return () => { cancelled = true }
+  }, [showNew, newProjectId])
 
   usePageMeta('文章管理')
 
@@ -137,12 +150,27 @@ export default function AdminArticles() {
     }
   }
 
+  const publishProject = async (targetProjectId: number, projectName: string) => {
+    setBatchBusy(true)
+    setError('')
+    try {
+      await api.updateProject(targetProjectId, { status: 'published' })
+      await load()
+      setNotice(`已发布项目「${projectName}」`)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
   const openNewDialog = () => {
     if (!projects.length) {
       navigate('/admin/projects')
       return
     }
     setNewProjectId(projectId || projects[0]?.id || 0)
+    setNewParentId(0)
     setNewTitle('')
     setNewStatus('published')
     setShowNew(true)
@@ -155,6 +183,7 @@ export default function AdminArticles() {
       status: newStatus,
       from: '/admin',
     })
+    if (newParentId) params.set('parentId', String(newParentId))
     if (newTitle.trim()) params.set('title', newTitle.trim())
     setShowNew(false)
     navigate(`/edit?${params.toString()}`)
@@ -324,9 +353,15 @@ export default function AdminArticles() {
                         {note.status === 'published' ? '已发布' : '草稿'}
                       </span>
                       {note.status === 'published' && note.project_status === 'draft' && (
-                        <span className="dim" style={{ display: 'block', fontSize: 11, marginTop: 3 }} title="所属项目仍为草稿，发布项目后访客可见">
-                          项目未发布
-                        </span>
+                        <button
+                          type="button"
+                          className="admin-inline-publish-btn"
+                          onClick={() => publishProject(note.project_id, note.project_name)}
+                          disabled={batchBusy}
+                          title="所属项目仍为草稿，点击立即发布所属项目"
+                        >
+                          项目未发布 · 点此发布
+                        </button>
                       )}
                     </td>
                     <td className="col-date">{formatDate(note.updated_at)}</td>
@@ -369,11 +404,23 @@ export default function AdminArticles() {
           <div className="modal-body">
             <label className="field">
               <span className="field-label">所属项目</span>
-              <select className="select" value={newProjectId} onChange={(e) => setNewProjectId(Number(e.target.value))}>
+              <select
+                className="select"
+                value={newProjectId}
+                onChange={(e) => { setNewProjectId(Number(e.target.value)); setNewParentId(0) }}
+              >
                 {projects.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}{p.status === 'draft' ? '（草稿项目）' : ''}
                   </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span className="field-label">所属文件夹（可选二级/多级目录）</span>
+              <select className="select" value={newParentId} onChange={(e) => setNewParentId(Number(e.target.value))}>
+                {newFolderOptions.map((opt) => (
+                  <option key={opt.id} value={opt.id}>{opt.label}</option>
                 ))}
               </select>
             </label>

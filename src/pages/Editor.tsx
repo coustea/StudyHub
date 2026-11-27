@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useAuth } from '../auth'
 import { useTheme } from '../theme'
 import { usePageMeta } from '../site'
+import { buildFolderOptions } from '../lib/tree'
 import MarkdownView from '../components/MarkdownView'
 import ProjectFileTree from '../components/ProjectFileTree'
 import MarkdownAssistant from '../components/MarkdownAssistant'
+import { ArticlePublishControl, DraftProjectBanner } from '../components/PublishControl'
 import Icon from '../components/Icon'
-import type { NoteNode } from '../types'
+import type { NoteNode, Project } from '../types'
 
 function insertAt(text: string, snippet: string, start: number, end: number) {
   const next = `${text.slice(0, start)}${snippet}${text.slice(end)}`
@@ -53,9 +55,12 @@ export default function Editor() {
   const [tags, setTags] = useState('')
   const [status, setStatus] = useState<'draft' | 'published'>(initialStatus)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [saving, setSaving] = useState(false)
+  const [publishingProject, setPublishingProject] = useState(false)
   const [savedAt, setSavedAt] = useState('')
   const [uploading, setUploading] = useState(false)
+  const [projectInfo, setProjectInfo] = useState<Project | null>(null)
   const [projectNodes, setProjectNodes] = useState<NoteNode[]>([])
   const [nodeProjectId, setNodeProjectId] = useState(0)
   const [parent, setParent] = useState(parentId)
@@ -72,20 +77,32 @@ export default function Editor() {
   const fileRef = useRef<HTMLInputElement>(null)
   const mdRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const saveRef = useRef<() => void>(() => {})
   const pid = projectId || nodeProjectId
   const draftKey = `notes_draft_${nodeId || `new-${projectId || 0}-${parentId}`}`
   const backTarget = fromPath.startsWith('/') ? fromPath : (user?.username === 'coustea' ? '/admin' : (pid ? `/p/${pid}` : '/'))
   const backLabel = fromPath.startsWith('/admin/projects/') ? '返回项目目录' : user?.username === 'coustea' ? '返回文章管理' : '返回阅读页'
+  const folderOptions = useMemo(
+    () => buildFolderOptions(projectNodes, kind === 'folder' ? nodeId : undefined),
+    [projectNodes, kind, nodeId],
+  )
 
   usePageMeta(nodeId ? '编辑内容' : '新建笔记')
 
   const loadTree = useCallback(async () => {
     if (!pid) return
     const res = await api.getProject(pid)
+    setProjectInfo(res.project)
     setProjectNodes(res.nodes)
   }, [pid])
 
   useEffect(() => { loadTree().catch((e) => setError(e.message)) }, [loadTree])
+
+  useEffect(() => {
+    if (!notice) return
+    const timer = window.setTimeout(() => setNotice(''), 2600)
+    return () => window.clearTimeout(timer)
+  }, [notice])
 
   const readDraft = useCallback(() => {
     try {
@@ -253,6 +270,7 @@ export default function Editor() {
       }
       setDirty(true)
       setError('')
+      setNotice(`已载入「${file.name}」（${parsed.body.length} 字），请确认后保存或发布`)
     } catch {
       setError('读取文件失败')
     }
@@ -280,29 +298,39 @@ export default function Editor() {
     setDirty(true)
   }
 
-  const save = async () => {
+  const save = async (nextStatus?: 'draft' | 'published') => {
     if (loadingNode) return
     if (!title.trim()) { setError('标题不能为空'); return }
     if (!nodeId && !projectId) { setError('缺少项目信息'); return }
     if (saving) return
+    const effectiveStatus = nextStatus ?? status
     setSaving(true)
     setError('')
     try {
-      const payload: Record<string, unknown> = { title: title.trim(), slug, content, tags, status }
+      const payload: Record<string, unknown> = {
+        title: title.trim(),
+        slug,
+        content,
+        tags,
+        status: effectiveStatus,
+        parentId: parent,
+      }
       if (!nodeId) {
-        payload.parentId = parent
         payload.sortOrder = Math.max(-1, ...projectNodes.filter((node) => node.parent_id === parent).map((node) => node.sort_order)) + 1
       }
       if (!nodeId && dailyDate) payload.dailyDate = dailyDate
       const res = nodeId
         ? await api.updateNode(nodeId, payload)
         : await api.createNode({ projectId, kind, ...payload })
+      setStatus(effectiveStatus)
       setDirty(false)
       setAutosavedAt('')
       setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }))
       localStorage.removeItem(draftKey)
       setNodeProjectId(res.node.project_id)
       await loadTree()
+      if (nextStatus === 'published') setNotice(status === 'published' ? '已更新发布内容' : '文章已发布')
+      else if (nextStatus === 'draft') setNotice('已存为草稿')
       if (!nodeId) {
         const nextParams = new URLSearchParams({ nodeId: String(res.node.id) })
         if (fromPath) nextParams.set('from', fromPath)
@@ -315,16 +343,45 @@ export default function Editor() {
     }
   }
 
+  saveRef.current = () => { save() }
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
         event.preventDefault()
-        save()
+        saveRef.current()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  })
+  }, [])
+
+  const publishProject = async () => {
+    if (!projectInfo || publishingProject) return
+    setPublishingProject(true)
+    setError('')
+    try {
+      await api.updateProject(projectInfo.id, { status: 'published' })
+      await loadTree()
+      setNotice(`已发布项目「${projectInfo.name}」`)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setPublishingProject(false)
+    }
+  }
+
+  const renameInTree = async (target: NoteNode, newTitle: string) => {
+    try {
+      await api.updateNode(target.id, { title: newTitle })
+      if (target.id === nodeId) setTitle(newTitle)
+      await loadTree()
+      setNotice(`已重命名为「${newTitle}」`)
+    } catch (e: any) {
+      setError(e.message)
+      throw e
+    }
+  }
 
   const goBack = () => {
     if (dirty && !window.confirm('还有未保存的修改，确定离开吗？')) return
@@ -418,16 +475,37 @@ export default function Editor() {
               <Icon name="book-open" size={14} />{status === 'draft' ? '预览草稿' : '查看文章'}
             </Link>
           )}
-          <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={saving || loadingNode} title="Cmd/Ctrl + S">
-            {saving ? '保存中…' : '保存'}
-          </button>
+          <ArticlePublishControl
+            mode="editor"
+            status={status}
+            busy={saving || loadingNode}
+            onPublish={() => save('published')}
+            onDraft={() => save('draft')}
+            saveHint="Cmd/Ctrl + S"
+          />
         </div>
       </div>
+
+      {projectInfo?.status === 'draft' && (
+        <DraftProjectBanner
+          projectName={projectInfo.name}
+          busy={publishingProject}
+          onPublishProject={publishProject}
+        />
+      )}
 
       {error && (
         <div className="alert" role="alert">
           <Icon name="warning-circle" size={16} />
           <span>{error}</span>
+          <button type="button" className="link-btn" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={() => setError('')}>关闭</button>
+        </div>
+      )}
+
+      {notice && (
+        <div className="alert alert-info" role="status">
+          <Icon name="check-circle" size={16} />
+          <span>{notice}</span>
         </div>
       )}
 
@@ -472,6 +550,7 @@ export default function Editor() {
               owner
               onSelect={openNode}
               onCreate={createInTree}
+              onRename={renameInTree}
               onMove={moveInTree}
               onDelete={deleteInTree}
               onEdit={openNode}
@@ -490,6 +569,20 @@ export default function Editor() {
               aria-label="文章标题"
             />
             <div className="editor-meta-row">
+              {pid > 0 && (
+                <label className="editor-inline-field editor-folder-field">
+                  <span>所属目录</span>
+                  <select
+                    className="select"
+                    value={parent}
+                    onChange={(e) => { setParent(Number(e.target.value)); setDirty(true) }}
+                  >
+                    {folderOptions.map((opt) => (
+                      <option key={opt.id} value={opt.id}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <label className="editor-inline-field">
                 <span>标签</span>
                 <input
@@ -498,17 +591,6 @@ export default function Editor() {
                   onChange={(e) => { setTags(e.target.value); setDirty(true) }}
                   placeholder="英文逗号分隔，如 Go, 并发"
                 />
-              </label>
-              <label className="editor-inline-field editor-status-field">
-                <span>状态</span>
-                <select
-                  className="select"
-                  value={status}
-                  onChange={(e) => { setStatus(e.target.value as 'draft' | 'published'); setDirty(true) }}
-                >
-                  <option value="published">已发布（访客可见）</option>
-                  <option value="draft">草稿（仅自己可见）</option>
-                </select>
               </label>
               <details className="editor-advanced">
                 <summary>URL 标识</summary>

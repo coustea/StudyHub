@@ -32,7 +32,7 @@ export default function Login() {
   return (
     <div className="auth-page">
       <section className="auth-pitch" aria-label="后台说明">
-        <h1>登录后管理你的笔记库。</h1>
+        <h1>登录后管理 拾页 · Folio。</h1>
         <p className="auth-lede">
           自托管技术刊物与知识工作台：正文留在自己的服务器上，写作、目录编排与公开发布清晰分离。
         </p>

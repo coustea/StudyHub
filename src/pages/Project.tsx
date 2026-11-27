@@ -48,6 +48,7 @@ export default function Project() {
   const [activeHeading, setActiveHeading] = useState('')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [tocCompact, setTocCompact] = useState(true)
+  const [showBackTop, setShowBackTop] = useState(false)
 
   const load = useCallback(() => api.getProject(id!, !preview).then((res) => {
     setProject(res.project)
@@ -177,18 +178,23 @@ export default function Project() {
 
   useEffect(() => {
     if (!activeHeading) return
-    const activeEl = document.querySelector(`.toc-panel [data-toc-id="${CSS.escape(activeHeading)}"]`)
-    activeEl?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    const activeEl = document.querySelector<HTMLElement>(`.toc-panel [data-toc-id="${CSS.escape(activeHeading)}"]`)
+    const scroller = activeEl?.closest<HTMLElement>('.tree-scroll')
+    if (!activeEl || !scroller) return
+    const targetTop = activeEl.offsetTop - scroller.clientHeight / 2 + activeEl.clientHeight / 2
+    scroller.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' })
   }, [activeHeading])
 
   useEffect(() => {
-    if (!headings.length) { setActiveHeading(''); return }
     const targets = headings.map((h) => document.getElementById(h.id)).filter((el): el is HTMLElement => Boolean(el))
-    if (!targets.length) { setActiveHeading(headings[0].id); return }
+    if (!headings.length) setActiveHeading('')
+    else if (!targets.length) setActiveHeading(headings[0].id)
 
     let raf = 0
     const sync = () => {
       raf = 0
+      setShowBackTop(window.scrollY > 320)
+      if (!targets.length) return
       const scrollBottom = window.scrollY + window.innerHeight
       const docHeight = document.documentElement.scrollHeight
       if (docHeight - scrollBottom <= 24) {
@@ -428,11 +434,16 @@ export default function Project() {
                   </Link>
                 ) : <span className="nav-placeholder" aria-hidden="true" />}
               </nav>
-              <div className="article-top-return">
-                <button type="button" className="link-btn" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>
-                  回到顶部
-                </button>
-              </div>
+              <button
+                type="button"
+                className={`floating-top${showBackTop ? ' is-visible' : ''}`}
+                aria-label="回到顶部"
+                title="回到顶部"
+                tabIndex={showBackTop ? 0 : -1}
+                onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+              >
+                <Icon name="caret-up" size={18} />
+              </button>
             </>
           ) : (
             <div className="empty" style={{ border: 0, background: 'transparent' }}>

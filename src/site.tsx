@@ -10,7 +10,7 @@ export interface SiteMeta {
 }
 
 const DEFAULT_SITE: SiteMeta = {
-  name: '笔记库',
+  name: '拾页 · Folio',
   description: '教程、笔记与代码示例，按项目归档。',
   projectCount: 0,
   noteCount: 0,

@@ -37,7 +37,7 @@ before(async () => {
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('服务启动超时')), 20000)
     server.stdout.on('data', (chunk) => {
-      if (String(chunk).includes('笔记库 API 已启动')) {
+      if (String(chunk).includes('API 已启动')) {
         clearTimeout(timer)
         resolve()
       }
@@ -444,6 +444,40 @@ test('笔记库 API 完整流程', async (t) => {
       files: [{ name: 'wrong.md', content: '# wrong' }],
     }, state.owner)).status, 400)
     assert.equal((await call('/api/import', 'POST', { projectId: state.pid, files: [{ name: 'a.md', content: 'x' }] })).status, 401)
+  })
+
+  await t.test('导入顺序：同目录连续编号，增量导入追加在已有内容之后', async () => {
+    const proj = await call('/api/projects', 'POST', { name: '导入顺序测试' }, state.owner)
+    const pid = proj.data.project.id
+
+    const first = await call('/api/import', 'POST', {
+      projectId: pid, parentId: 0, status: 'published',
+      files: [
+        { name: 'a.md', path: '01 基础/01-概述.md', content: '# 概述' },
+        { name: 'b.md', path: '01 基础/02-变量.md', content: '# 变量' },
+      ],
+    }, state.owner)
+    assert.equal(first.status, 200)
+    assert.equal(first.data.imported, 2)
+
+    const second = await call('/api/import', 'POST', {
+      projectId: pid, parentId: 0, status: 'published',
+      files: [
+        { name: 'c.md', path: '02 进阶/01-循环.md', content: '# 循环' },
+        { name: 'd.md', path: '01 基础/03-补充.md', content: '# 补充' },
+      ],
+    }, state.owner)
+    assert.equal(second.status, 200)
+    assert.equal(second.data.imported, 2)
+
+    const detail = await call(`/api/projects/${pid}`, 'GET', undefined, state.owner)
+    const rootTitles = detail.data.nodes.filter((n) => n.parent_id === 0).map((n) => n.title)
+    assert.deepEqual(rootTitles, ['01 基础', '02 进阶'], '文件夹按导入先后排列')
+    const folderId = detail.data.nodes.find((n) => n.title === '01 基础').id
+    const inFolder = detail.data.nodes.filter((n) => n.parent_id === folderId).map((n) => n.title)
+    assert.deepEqual(inFolder, ['概述', '变量', '补充'], '增量导入应追加在已有笔记之后，而不是插到最前')
+
+    await call(`/api/projects/${pid}`, 'DELETE', undefined, state.owner)
   })
 
   await t.test('全文搜索 / 标签 / 最近更新', async () => {

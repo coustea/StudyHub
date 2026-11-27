@@ -36,7 +36,7 @@ before(async () => {
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('服务启动超时')), 20000)
     server.stdout.on('data', (chunk) => {
-      if (String(chunk).includes('笔记库 API 已启动')) {
+      if (String(chunk).includes('API 已启动')) {
         clearTimeout(timer)
         resolve()
       }

@@ -56,7 +56,7 @@ const MIME_EXT = {
   'application/pdf': '.pdf',
 }
 
-const SITE_NAME = process.env.SITE_NAME || '笔记库'
+const SITE_NAME = process.env.SITE_NAME || '拾页 · Folio'
 const SITE_DESCRIPTION = process.env.SITE_DESCRIPTION || '教程、笔记与代码示例，按项目归档。'
 const SITE_OWNER = process.env.SITE_OWNER === undefined ? 'coustea' : process.env.SITE_OWNER
 // 默认只信任一层反向代理（nginx / docker compose 的网关）。
@@ -671,9 +671,10 @@ app.post('/api/ai/markdown', requireCoustea, aiLimiter, async (req, res) => {
   const input = `标题：${title.trim() || '未命名笔记'}\n任务：${task}\n写作要求：${prompt.trim()}${context ? `\n已有内容：\n${context}` : ''}`
 
   try {
-    const client = new OpenAI({ apiKey: apiKey.trim(), baseURL: endpoint, timeout: 60000, maxRetries: 0 })
+    const client = new OpenAI({ apiKey: apiKey.trim(), baseURL: endpoint, timeout: 120000, maxRetries: 0 })
     const response = await client.chat.completions.create({
       model: model.trim(),
+      ...(endpoint.includes('xf-yun.com') ? { thinking: { type: 'disabled' } } : {}),
       messages: [
         { role: 'system', content: '你是技术学习笔记写作助手。只输出可直接插入文章的 Markdown 正文，不要用代码围栏包裹整段回答。代码示例要准确；不确定的事实不要编造。' },
         { role: 'user', content: input },
@@ -1032,6 +1033,23 @@ function importMarkdownTree({ project, userId, parentId, files, status }) {
   const skipped = []
   let duplicates = 0
 
+  // 同一父目录内单独计数，从已有兄弟节点的最大 sort_order 之后追加：
+  // 批次内保持前端传来的路径排序，新导入的内容也不会插队到已有笔记前面
+  const orderCounters = new Map()
+  const nextOrder = (parent) => {
+    if (!orderCounters.has(parent)) {
+      const row = db.prepare(`
+        SELECT COALESCE(MAX(sort_order), -1) AS maxOrder
+        FROM nodes
+        WHERE project_id = ? AND parent_id = ? AND deleted_at IS NULL
+      `).get(project.id, parent)
+      orderCounters.set(parent, Number(row.maxOrder) + 1)
+    }
+    const value = orderCounters.get(parent)
+    orderCounters.set(parent, value + 1)
+    return value
+  }
+
   const findOrCreateFolder = (parent, title) => {
     const slug = slugify(title) || 'folder'
     const found = db.prepare(`
@@ -1040,9 +1058,9 @@ function importMarkdownTree({ project, userId, parentId, files, status }) {
     `).get(project.id, parent, slug)
     if (found) return found.id
     const info = db.prepare(`
-      INSERT INTO nodes (owner_id, project_id, parent_id, kind, title, slug, status)
-      VALUES (?, ?, ?, 'folder', ?, ?, ?)
-    `).run(userId, project.id, parent, title, slug, status)
+      INSERT INTO nodes (owner_id, project_id, parent_id, kind, title, slug, status, sort_order)
+      VALUES (?, ?, ?, 'folder', ?, ?, ?, ?)
+    `).run(userId, project.id, parent, title, slug, status, nextOrder(parent))
     return Number(info.lastInsertRowid)
   }
 
@@ -1073,7 +1091,11 @@ function importMarkdownTree({ project, userId, parentId, files, status }) {
       const title = String(meta.title || meta.sidebar_label || headingTitle
         || filename.replace(/\.(md|markdown|mdx|txt)$/i, ''))
       const tags = Array.isArray(meta.tags) ? meta.tags.join(',') : String(meta.tags || '')
-      const order = Number(meta.order ?? meta.sidebar_position ?? meta.sort_order ?? index)
+      // front-matter 显式给了数字 order 时才采用，否则按路径顺序在目录内依次编号
+      const rawOrder = meta.order ?? meta.sidebar_position ?? meta.sort_order
+      const explicitOrder = rawOrder !== undefined && rawOrder !== null
+        && String(rawOrder).trim() !== '' && Number.isFinite(Number(rawOrder))
+      const order = explicitOrder ? Number(rawOrder) : nextOrder(parent)
       // 导入时识别 front-matter 里的日期，让历史笔记也能落到正确的学习日
       const dailyDate = normalizeDate(meta.date || meta.created || meta.daily)
         || String(meta.date || '').slice(0, 10) || today()
@@ -1682,7 +1704,7 @@ function auditProductionConfig() {
 auditProductionConfig()
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`笔记库 API 已启动：http://localhost:${PORT}`)
+  console.log(`拾页 · Folio API 已启动：http://localhost:${PORT}`)
   if (!IS_PROD) {
     console.log('开发模式：前端由 vite 提供（npm run dev），已构建的 dist 会同时被托管。')
   }

@@ -48,7 +48,7 @@ export default function AdminLayout() {
 
       <header className="admin-mobile-bar">
         <Link to="/admin" className="brand">
-          <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '笔'}</span>
+          <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '拾'}</span>
           <span className="brand-name">{site.name} · 后台</span>
         </Link>
         <div className="topbar-actions">
@@ -69,7 +69,7 @@ export default function AdminLayout() {
       <aside id="admin-sidebar" className={`admin-sidebar${drawerOpen ? ' is-open' : ''}`}>
         <div className="admin-brand">
           <Link to="/admin" className="brand">
-            <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '笔'}</span>
+            <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '拾'}</span>
             <span className="brand-name">{site.name}</span>
           </Link>
           <span className="badge">管理后台</span>

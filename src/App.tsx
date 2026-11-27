@@ -80,7 +80,7 @@ function PublicLayout() {
       <header className="topbar">
         <div className="topbar-inner">
           <Link to="/" className="brand" aria-label={`${site.name} 首页`}>
-            <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '笔'}</span>
+            <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '拾'}</span>
             <span className="brand-name">{site.name}</span>
           </Link>
 
@@ -171,7 +171,7 @@ function AuthLayout() {
       <a className="skip-link" href="#main-content">跳到正文</a>
       <header className="auth-topbar">
         <Link to="/" className="brand" aria-label={`${site.name} 首页`}>
-          <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '笔'}</span>
+          <span className="brand-mark" aria-hidden="true">{site.name.trim().slice(0, 1) || '拾'}</span>
           <span className="brand-name">{site.name}</span>
         </Link>
         <ThemeToggle />

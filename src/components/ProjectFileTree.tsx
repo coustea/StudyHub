@@ -17,7 +17,7 @@ function buildTree(nodes: NoteNode[]): TreeNode[] {
   return roots
 }
 
-export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, onCreate, onMove, onDelete, onEdit }: {
+export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, onCreate, onMove, onDelete, onEdit, onRename, onImportInto }: {
   nodes: NoteNode[]
   selectedId: number | null
   owner: boolean
@@ -26,12 +26,15 @@ export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, on
   onMove: (id: number, parentId: number, beforeId: number | null) => Promise<void>
   onDelete: (node: NoteNode) => void
   onEdit: (node: NoteNode) => void
+  onRename?: (node: NoteNode, title: string) => Promise<void>
+  onImportInto?: (folder: NoteNode) => void
 }) {
   const tree = useMemo(() => buildTree(nodes), [nodes])
   const byId = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes])
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set())
   const [creating, setCreating] = useState<{ parentId: number; kind: Kind } | null>(null)
   const [name, setName] = useState('')
+  const [renaming, setRenaming] = useState<{ id: number; title: string } | null>(null)
   const [busy, setBusy] = useState(false)
   const [drop, setDrop] = useState<Destination | null>(null)
   const [announcement, setAnnouncement] = useState('')
@@ -51,6 +54,7 @@ export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, on
   }
 
   const beginCreate = (parentId: number, kind: Kind) => {
+    setRenaming(null)
     setCreating({ parentId, kind })
     setName('')
     if (parentId) setCollapsed((previous) => {
@@ -66,9 +70,32 @@ export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, on
     setBusy(true)
     try {
       await onCreate(creating.parentId, creating.kind, name.trim())
+      setAnnouncement(`已创建${creating.kind === 'folder' ? '文件夹' : '笔记'} ${name.trim()}`)
       setCreating(null)
       setName('')
     } catch { setAnnouncement('创建失败，请检查提示后重试') }
+    finally { setBusy(false) }
+  }
+
+  const beginRename = (node: NoteNode) => {
+    if (!onRename) { onEdit(node); return }
+    setCreating(null)
+    setRenaming({ id: node.id, title: node.title })
+  }
+
+  const submitRename = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!renaming || !onRename || busy) return
+    const nextTitle = renaming.title.trim()
+    const target = byId.get(renaming.id)
+    if (!target || !nextTitle) return
+    if (nextTitle === target.title) { setRenaming(null); return }
+    setBusy(true)
+    try {
+      await onRename(target, nextTitle)
+      setAnnouncement(`已重命名为 ${nextTitle}`)
+      setRenaming(null)
+    } catch { setAnnouncement('重命名失败，请重试') }
     finally { setBusy(false) }
   }
 
@@ -187,52 +214,102 @@ export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, on
     } catch { setAnnouncement(`移动 ${node.title} 失败`) }
   }
 
-  const createInput = (depth: number) => creating && (
-    <form className="tree-new" style={{ paddingLeft: 8 + depth * 14 }} onSubmit={submitCreate}>
-      <Icon name={creating.kind === 'folder' ? 'folder' : 'file'} size={15} />
-      <input autoFocus aria-label={creating.kind === 'folder' ? '文件夹名称' : '笔记名称'}
-        value={name} onChange={(event) => setName(event.target.value)}
-        onKeyDown={(event) => { if (event.key === 'Escape') setCreating(null) }}
-        placeholder={creating.kind === 'folder' ? '文件夹名称' : '笔记名称'} disabled={busy} />
-      <button type="submit" title="创建" aria-label="创建" disabled={!name.trim() || busy}><Icon name="check" size={14} /></button>
-    </form>
-  )
+  const createInput = (depth: number) => {
+    if (!creating) return null
+    const parentNode = creating.parentId ? byId.get(creating.parentId) : null
+    const placeholder = creating.kind === 'folder'
+      ? (parentNode ? `在「${parentNode.title}」下新建子文件夹` : '在根目录新建文件夹')
+      : (parentNode ? `在「${parentNode.title}」下新建笔记` : '在根目录新建笔记')
+    return (
+      <form className="tree-new" style={{ paddingLeft: 8 + depth * 14 }} onSubmit={submitCreate}>
+        <Icon name={creating.kind === 'folder' ? 'folder' : 'file'} size={15} />
+        <input
+          autoFocus
+          aria-label={placeholder}
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') setCreating(null) }}
+          placeholder={placeholder}
+          disabled={busy}
+        />
+        <button type="submit" title="确认创建" aria-label="确认创建" disabled={!name.trim() || busy}>
+          <Icon name="check" size={14} />
+        </button>
+        <button type="button" title="取消" aria-label="取消创建" onClick={() => setCreating(null)} disabled={busy}>
+          <Icon name="x" size={14} />
+        </button>
+      </form>
+    )
+  }
 
   const renderItems = (items: TreeNode[], depth: number): ReactNode => items.map((node) => {
     const folder = node.kind === 'folder'
     const open = !collapsed.has(node.id)
     const active = selectedId === node.id
+    const isRenaming = renaming?.id === node.id
     return <div key={node.id}>
-      <div className={`tree-row${active ? ' active' : ''}${drop?.targetId === node.id ? ` drop-${drop.position}` : ''}`}
-        data-tree-node={node.id} style={{ paddingLeft: 8 + depth * 14 }}>
-        {owner && <button type="button" className="tree-drag" data-drag-id={node.id}
-          title="拖动整理；Alt + 方向键移动" aria-label={`移动 ${node.title}，Alt 加方向键调整位置`}
-          onPointerDown={(event) => pointerDown(event, node)} onPointerMove={pointerMove}
-          onPointerUp={pointerUp} onPointerCancel={stopDrag} onLostPointerCapture={stopDrag}
-          onKeyDown={(event) => moveByKeyboard(event, node)}>
-          <span aria-hidden="true">⠿</span>
-        </button>}
-        <button type="button" className="tree-select" aria-expanded={folder ? open : undefined}
-          aria-current={active ? 'page' : undefined}
-          onClick={() => folder ? setCollapsed((previous) => {
-            const next = new Set(previous)
-            if (next.has(node.id)) next.delete(node.id)
-            else next.add(node.id)
-            return next
-          }) : onSelect(node)}>
-          <span className="tree-icon" aria-hidden="true"><Icon name={folder ? (open ? 'folder-open' : 'folder') : 'file'} size={15} /></span>
-          <span className="tree-title">{node.title}</span>
-          {node.status === 'draft' && <span className="tree-draft" title="草稿" />}
-        </button>
-        {owner && <span className="tree-actions">
-          {folder && <>
-            <button type="button" title="新建文件夹" aria-label={`在 ${node.title} 下新建文件夹`} onClick={() => beginCreate(node.id, 'folder')}><Icon name="folder" size={14} /></button>
-            <button type="button" title="新建笔记" aria-label={`在 ${node.title} 下新建笔记`} onClick={() => beginCreate(node.id, 'doc')}><Icon name="plus" size={14} /></button>
-          </>}
-          <button type="button" title="重命名或编辑" aria-label={`编辑 ${node.title}`} onClick={() => onEdit(node)}><Icon name="pencil" size={14} /></button>
-          <button type="button" className="is-danger" title="删除" aria-label={`删除 ${node.title}`} onClick={() => onDelete(node)}><Icon name="x" size={14} /></button>
-        </span>}
-      </div>
+      {isRenaming ? (
+        <form className="tree-new tree-rename" style={{ paddingLeft: 8 + depth * 14 }} onSubmit={submitRename}>
+          <Icon name={folder ? 'folder' : 'file'} size={15} />
+          <input
+            autoFocus
+            aria-label={`重命名 ${node.title}`}
+            value={renaming.title}
+            onFocus={(event) => event.currentTarget.select()}
+            onChange={(event) => setRenaming({ id: node.id, title: event.target.value })}
+            onKeyDown={(event) => { if (event.key === 'Escape') setRenaming(null) }}
+            disabled={busy}
+          />
+          <button type="submit" title="保存名称" aria-label="保存名称" disabled={!renaming.title.trim() || busy}>
+            <Icon name="check" size={14} />
+          </button>
+          <button type="button" title="取消" aria-label="取消重命名" onClick={() => setRenaming(null)} disabled={busy}>
+            <Icon name="x" size={14} />
+          </button>
+        </form>
+      ) : (
+        <div className={`tree-row${active ? ' active' : ''}${drop?.targetId === node.id ? ` drop-${drop.position}` : ''}`}
+          data-tree-node={node.id} style={{ paddingLeft: 8 + depth * 14 }}>
+          {owner && <button type="button" className="tree-drag" data-drag-id={node.id}
+            title="拖动整理；Alt + 方向键移动" aria-label={`移动 ${node.title}，Alt 加方向键调整位置`}
+            onPointerDown={(event) => pointerDown(event, node)} onPointerMove={pointerMove}
+            onPointerUp={pointerUp} onPointerCancel={stopDrag} onLostPointerCapture={stopDrag}
+            onKeyDown={(event) => moveByKeyboard(event, node)}>
+            <span aria-hidden="true">⠿</span>
+          </button>}
+          <button type="button" className="tree-select" aria-expanded={folder ? open : undefined}
+            aria-current={active ? 'page' : undefined}
+            onDoubleClick={owner && folder && onRename ? () => beginRename(node) : undefined}
+            onClick={() => folder ? setCollapsed((previous) => {
+              const next = new Set(previous)
+              if (next.has(node.id)) next.delete(node.id)
+              else next.add(node.id)
+              return next
+            }) : onSelect(node)}>
+            <span className="tree-icon" aria-hidden="true"><Icon name={folder ? (open ? 'folder-open' : 'folder') : 'file'} size={15} /></span>
+            <span className="tree-title">{node.title}</span>
+            {!folder && node.status === 'draft' && <span className="tree-draft-pill" title="草稿（访客不可见）">草稿</span>}
+          </button>
+          {owner && <span className="tree-actions">
+            {folder && <>
+              <button type="button" title="新建子文件夹" aria-label={`在 ${node.title} 下新建子文件夹`} onClick={() => beginCreate(node.id, 'folder')}><Icon name="folder" size={14} /></button>
+              <button type="button" title="新建笔记" aria-label={`在 ${node.title} 下新建笔记`} onClick={() => beginCreate(node.id, 'doc')}><Icon name="plus" size={14} /></button>
+              {onImportInto && (
+                <button type="button" title="导入 Markdown 到此文件夹" aria-label={`导入 Markdown 到 ${node.title}`} onClick={() => onImportInto(node)}><Icon name="upload" size={14} /></button>
+              )}
+            </>}
+            <button
+              type="button"
+              title={folder && onRename ? '重命名文件夹' : '编辑'}
+              aria-label={folder && onRename ? `重命名 ${node.title}` : `编辑 ${node.title}`}
+              onClick={() => (folder && onRename ? beginRename(node) : onEdit(node))}
+            >
+              <Icon name="pencil" size={14} />
+            </button>
+            <button type="button" className="is-danger" title="删除" aria-label={`删除 ${node.title}`} onClick={() => onDelete(node)}><Icon name="x" size={14} /></button>
+          </span>}
+        </div>
+      )}
       {folder && open && <>
         {creating?.parentId === node.id && createInput(depth + 1)}
         {renderItems(node.children, depth + 1)}
@@ -242,21 +319,25 @@ export default function ProjectFileTree({ nodes, selectedId, owner, onSelect, on
 
   return <>
     {owner && <div className="tree-toolbar">
-      <strong>文件</strong>
-      <div>
-        <button type="button" title="在项目根目录新建笔记" aria-label="新建笔记" onClick={() => beginCreate(0, 'doc')}><Icon name="file" size={17} /></button>
-        <button type="button" title="在项目根目录新建文件夹" aria-label="新建文件夹" onClick={() => beginCreate(0, 'folder')}><Icon name="folder" size={17} /></button>
+      <strong>目录</strong>
+      <div className="tree-toolbar-actions">
+        <button type="button" className="tree-toolbar-btn" title="在项目根目录新建文件夹" onClick={() => beginCreate(0, 'folder')}>
+          <Icon name="folder" size={14} /><span>文件夹</span>
+        </button>
+        <button type="button" className="tree-toolbar-btn" title="在项目根目录新建笔记" onClick={() => beginCreate(0, 'doc')}>
+          <Icon name="plus" size={14} /><span>笔记</span>
+        </button>
       </div>
     </div>}
     <div className="tree-scroll file-tree-scroll" ref={scroller}>
       {creating?.parentId === 0 && createInput(0)}
       {renderItems(tree, 0)}
       {owner && <div className={`tree-root-drop${drop?.position === 'root' ? ' is-target' : ''}`} data-tree-root>
-        {tree.length ? '拖到这里移至项目根目录' : '点击上方图标，新建文件夹或笔记'}
+        {tree.length ? '拖到这里移至项目根目录' : '点击上方「文件夹」或「笔记」开始搭建目录'}
       </div>}
       {!owner && !tree.length && <p className="dim tree-empty">还没有内容</p>}
     </div>
-    {owner && <p className="tree-hint">拖动左侧手柄整理文件；键盘可用 Alt + 方向键。</p>}
+    {owner && <p className="tree-hint">悬停文件夹可建二级子目录或导入；双击名称或点铅笔可直接重命名。</p>}
     <span className="sr-only" role="status" aria-live="polite">{announcement}</span>
   </>
 }

@@ -34,16 +34,16 @@ export default function CodeBlock({ children }: ComponentProps<'pre'>) {
 
   return (
     <div className="code-block">
-      <div className="code-block-head">
-        <span className="code-lang">{language || 'code'}</span>
+      <div className="code-block-actions">
+        {language && <span className="code-lang">{language}</span>}
         <button
           type="button"
           className={`code-copy ${copied ? 'copied' : ''}`}
           onClick={copy}
           aria-label={copied ? '已复制' : '复制代码'}
         >
-          <Icon name={copied ? 'check' : 'copy'} size={12} />
-          {copied ? '已复制' : '复制'}
+          <Icon name={copied ? 'check' : 'copy'} size={13} />
+          <span>{copied ? '已复制' : '复制'}</span>
         </button>
       </div>
       <pre ref={preRef}>{children}</pre>
